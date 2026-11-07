@@ -200,6 +200,20 @@ int gfx_window_monitor_size(int *w, int *h) {
     return 1;
 }
 
+static int miojo_title;
+enum { COMPILE_TITLE_TIMER = 1 };
+
+static void update_compile_title(HWND h) {
+    uint32_t graphics, compute;
+    vk_pipeline_compile_counts(&graphics, &compute);
+    wchar_t title[192], previous[192];
+    swprintf(title, sizeof title / sizeof *title,
+             L"Ocarina Recomp%ls | Compilando: %u shaders | Pipelines: %u graficos + %u compute",
+             miojo_title ? L" - feito com miojo" : L"", gfx_shader_compiling(), graphics, compute);
+    GetWindowTextW(h, previous, sizeof previous / sizeof *previous);
+    if (wcscmp(title, previous)) SetWindowTextW(h, title);
+}
+
 // Type the cook's name in the game window. A secret from Miojo: see the README.
 static void miojo_key(HWND h, WPARAM w, LPARAM l) {
     static const char name[] = "MIOJO";
@@ -208,7 +222,8 @@ static void miojo_key(HWND h, WPARAM w, LPARAM l) {
     at = w == (WPARAM)name[at] ? at + 1 : w == 'M';
     if (name[at]) return;
     at = 0;
-    SetWindowTextW(h, L"Ocarina Recomp - feito com miojo");
+    miojo_title = 1;
+    update_compile_title(h);
     menu_miojo();
 }
 
@@ -217,6 +232,12 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (input_window_msg(h, m, w, l, &input_res)) return input_res;
     if (menu_window_msg(h, m, w, l, &input_res)) return input_res;
     switch (m) {
+    case WM_TIMER:
+        if (w == COMPILE_TITLE_TIMER) {
+            update_compile_title(h);
+            return 0;
+        }
+        break;
     case WM_KEYDOWN:
         miojo_key(h, w, l);
         if (w == VK_F11 && !(l & (1 << 30))) {   // bit 30: auto-repeat
@@ -335,6 +356,8 @@ static void window_main(void *arg) {
         note_applied();
         refresh_rate_update(g_hwnd, 1);
         keep_awake(1);
+        update_compile_title(g_hwnd);
+        SetTimer(g_hwnd, COMPILE_TITLE_TIMER, 250, NULL);
     }
     plat_event_set(&g_wnd_ready);
     if (g_wnd_failed) return;

@@ -494,14 +494,22 @@ static void svc_set_limit(int n) {
     plat_cond_broadcast(&S.freed);
 }
 
+static uint32_t compiling;
+
+uint32_t gfx_shader_compiling(void) {
+    return __atomic_load_n(&compiling, __ATOMIC_RELAXED);
+}
+
 // One request on a child; a dead child is restarted once. 0 when the translator is unavailable. The caller has given
 // up its virtual core (kern_core_away): the wait for a child and the translation are host time.
 static int svc_request(const char *line, char *reply, size_t reply_size) {
     Svc *v = svc_get();
+    __atomic_add_fetch(&compiling, 1, __ATOMIC_RELAXED);
     int ok = 0;
     for (int attempt = 0; attempt < 2 && !ok; attempt++)
         if (!(ok = child_exchange(v, line, reply, reply_size))) child_stop(v);
     svc_put(v);
+    __atomic_sub_fetch(&compiling, 1, __ATOMIC_RELAXED);
     return ok;
 }
 

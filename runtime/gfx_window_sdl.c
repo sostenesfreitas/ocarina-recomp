@@ -28,6 +28,20 @@
 #include "platform/platform.h"
 
 static SDL_Window *g_win;
+
+static void update_compile_title(void) {
+    static Uint64 last;
+    Uint64 now = SDL_GetTicks();
+    if (!g_win || now - last < 250) return;
+    last = now;
+    uint32_t graphics, compute;
+    vk_pipeline_compile_counts(&graphics, &compute);
+    char title[192];
+    snprintf(title, sizeof title,
+             "Ocarina Recomp | Compilando: %u shaders | Pipelines: %u graficos + %u compute",
+             gfx_shader_compiling(), graphics, compute);
+    if (strcmp(title, SDL_GetWindowTitle(g_win))) SDL_SetWindowTitle(g_win, title);
+}
 static uint32_t g_ev_base;               // SDL_RegisterEvents: the user events below
 enum { EV_RUN, EV_SETTINGS, EV_CLOSE, EV_COUNT };
 static PlatEvent g_video_ready;          // manual-reset: SDL video is up (or failed)
@@ -214,6 +228,7 @@ static void window_main(void *arg) {
         SDL_Event e;
         if (SDL_WaitEventTimeout(&e, 100)) handle(&e);
         else input_sdl_idle();   // a cursor change requested from another thread meanwhile
+        update_compile_title();
     }
 }
 

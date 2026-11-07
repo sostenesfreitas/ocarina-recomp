@@ -550,6 +550,7 @@ typedef struct { uint64_t graphics, compute, failures, hits, layouts, push_layou
 void vk_pipeline_stats(VkPipeStats *s);
 void vk_pipeline_save(void);               // writes the VkPipelineCache to pipeline-cache.bin next to totk.exe
 void vk_pipeline_autosave(void);           // vk_pipeline_save at most every 20 s, when pipelines were built since
+void vk_pipeline_compile_counts(uint32_t *graphics, uint32_t *compute);   // driver calls currently in progress
 void vk_pipeline_shutdown(void);           // waits for background builds, saves, destroys pipelines, layouts and the
                                            // cache; before vk_shutdown
 int vk_pipeline_selftest(void);            // one graphics and one compute pipeline from census shaders; 0 on success

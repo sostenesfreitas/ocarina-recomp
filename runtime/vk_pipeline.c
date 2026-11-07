@@ -53,6 +53,29 @@
 #include "platform/platform.h"
 #include "tex.h"
 
+static uint32_t compiling_graphics, compiling_compute;
+
+void vk_pipeline_compile_counts(uint32_t *graphics, uint32_t *compute) {
+    *graphics = __atomic_load_n(&compiling_graphics, __ATOMIC_RELAXED);
+    *compute = __atomic_load_n(&compiling_compute, __ATOMIC_RELAXED);
+}
+
+static VkResult create_graphics_pipeline(VkDevice device, VkPipelineCache cache,
+                                         const VkGraphicsPipelineCreateInfo *info, VkPipeline *out) {
+    __atomic_add_fetch(&compiling_graphics, 1, __ATOMIC_RELAXED);
+    VkResult r = vkCreateGraphicsPipelines(device, cache, 1, info, NULL, out);
+    __atomic_sub_fetch(&compiling_graphics, 1, __ATOMIC_RELAXED);
+    return r;
+}
+
+static VkResult create_compute_pipeline(VkDevice device, VkPipelineCache cache,
+                                        const VkComputePipelineCreateInfo *info, VkPipeline *out) {
+    __atomic_add_fetch(&compiling_compute, 1, __ATOMIC_RELAXED);
+    VkResult r = vkCreateComputePipelines(device, cache, 1, info, NULL, out);
+    __atomic_sub_fetch(&compiling_compute, 1, __ATOMIC_RELAXED);
+    return r;
+}
+
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
 
 enum { SPV_OP_ENTRY_POINT = 15, SPV_OP_TYPE_INT = 21, SPV_OP_TYPE_FLOAT = 22, SPV_OP_TYPE_VECTOR = 23,
@@ -2222,7 +2245,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         pi.pVertexInputState = NULL, pi.pInputAssemblyState = NULL;
     }
     uint64_t p0 = perf_begin();
-    VkResult r = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
+    VkResult r = create_graphics_pipeline(P.device, P.cache, &pi, &pipe);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
     if (r != VK_SUCCESS) {
         rt_log("vk_pipeline: vkCreateGraphicsPipelines failed (%d)", (int)r);
@@ -2378,7 +2401,7 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         ri.depthAttachmentFormat = (VkFormat)k->depth, ri.stencilAttachmentFormat = (VkFormat)k->stencil;
         pi.pColorBlendState = &cb, pi.pMultisampleState = &ms;
     }
-    if (vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    if (create_graphics_pipeline(P.device, P.cache, &pi, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
 out:
     if (m) vkDestroyShaderModule(P.device, m, NULL);
     free(patched);
@@ -2571,7 +2594,7 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
                                            .layout = l->layout};
         if (build) plat_mutex_unlock(&P.lock);
         uint64_t t1 = qpc();
-        if (vkCreateGraphicsPipelines(P.device, VK_NULL_HANDLE, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+        if (create_graphics_pipeline(P.device, VK_NULL_HANDLE, &pi, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
         double ms = ms_since(t1);   // the link alone: library builds are counted apart
         if (build) plat_mutex_lock(&P.lock);
         P.g.link_ms += ms;
@@ -3345,7 +3368,7 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
         if (ci.stage.pNext && ls[0] && ls[0] % vk_caps.sg_size == 0) ci.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     }
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (vkCreateComputePipelines(P.device, cs_build_cache ? cs_build_cache : P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    if (create_compute_pipeline(P.device, cs_build_cache ? cs_build_cache : P.cache, &ci, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
     vkDestroyShaderModule(P.device, m, NULL);
     return pipe;
 }
