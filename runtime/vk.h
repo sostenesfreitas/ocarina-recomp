@@ -242,6 +242,8 @@ const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void);
 void vk_headroom_start(void);
 void vk_headroom_stop(void);   // before vmaDestroyAllocator
 int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out);   // 1 when all of [addr, addr+size) is backed
+// The same, but a CPU-visible pool whose shadow storage is not made yet stays unbacked instead of getting it.
+int vk_mem_resolve_existing(uint64_t addr, uint64_t size, VkMemSpan *out);
 // Changes whenever vk_mem_resolve plus VK_MEM_USE may give another span for an address: a pool added, finalized or
 // mapped, a mirror created, refused or forgotten, a submission started.
 uint64_t vk_mem_gen(void);

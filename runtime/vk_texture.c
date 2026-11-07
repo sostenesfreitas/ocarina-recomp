@@ -226,7 +226,7 @@ static int bind_pool_memory(VkCtx *c, Tex *e, VkImage img, uint64_t guest_size) 
     if ((e->f.depth || e->f.stencil) && req.size > guest_size) return 0;
     VkMemSpan sp;
     if (!req.size) return 0;   // an image the device could not lay out (image_size)
-    if (!vk_mem_resolve(e->pub.addr, req.size, &sp) || !sp.alloc || sp.alloc_offset % req.alignment) return 0;
+    if (!vk_mem_resolve_existing(e->pub.addr, req.size, &sp) || !sp.alloc || sp.alloc_offset % req.alignment) return 0;
     VmaAllocationInfo info;
     vmaGetAllocationInfo(c->vma, sp.alloc, &info);
     if (!(req.memoryTypeBits >> info.memoryType & 1)) return 0;
