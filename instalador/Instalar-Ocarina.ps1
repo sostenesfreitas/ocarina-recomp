@@ -517,6 +517,11 @@ $script:jogo = $null; $script:jogoNup = $false; $script:nupOpcoes = @('--overlay
 $script:pasta = if ($env:OCARINA_PASTA) { $env:OCARINA_PASTA } else { PastaPadrao }
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { $script:avisos += (L 'Este instalador só funciona em Windows de 64 bits.' 'This installer only works on 64-bit Windows.'); $script:bloqueio = $true }
 $ram = [Math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+# Commit limit (RAM plus page file): on a first start the game commits about 24 GB (its 9 GB of console memory, the
+# driver's backing for video memory, shader builds). Windows closes it when the limit is lower: a 16 GB PC with the
+# page file the system manages (issue #72, limit 19.6 GB) froze and closed at the Deku Tree scene.
+$commitGb = [Math]::Round((Get-CimInstance Win32_OperatingSystem).TotalVirtualMemorySize / 1MB)
+if ($commitGb -lt 26) { $script:avisos += (L "O Windows deixa usar até $commitGb GB de memória (RAM + arquivo de paginação) e o jogo pode precisar de uns 24 GB na primeira vez. Aumente o arquivo de paginação: Configurações avançadas do sistema > Desempenho > Avançado > Memória virtual > Alterar > tamanho personalizado, inicial 16384 MB e máximo 32768 MB, e reinicie o PC." "Windows allows up to $commitGb GB of memory (RAM + page file) and the game may need about 24 GB the first time. Enlarge the page file: Advanced system settings > Performance > Advanced > Virtual memory > Change > custom size, initial 16384 MB and maximum 32768 MB, then restart the PC.") }
 if ($ram -lt 15) { $script:avisos += (L "Este PC tem $ram GB de RAM. Com menos de 16 GB, nunca testamos: a compilação ou o jogo podem falhar." "This PC has $ram GB of RAM. We never tested with less than 16 GB: the build or the game may fail.") }
 $gpus = (Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }) -join ', '
 Add-Type -Namespace Ocarina -Name Cpu -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool IsProcessorFeaturePresent(uint f);'
