@@ -110,6 +110,7 @@ Leva de 30 minutos a 2 horas, e você pode usar o PC enquanto isso. Para atualiz
 |---|---|
 | "Este jogo não é a versão 1.1.1" | Confira se escolheu o jogo certo e atualizado |
 | O jogo abre e fecha | Atualize o driver da placa de vídeo e veja o arquivo `ultima-partida-erros.log` na pasta de instalação |
+| O jogo fechou de novo na mesma cena | Se o crash foi no compilador do driver da placa de vídeo, o pipeline vai para a quarentena (`build\oot111\pipeline-quarantine.txt`): na próxima vez ele é compilado sem otimização e, se cair de novo, é pulado. Apague o arquivo depois de atualizar o driver |
 | Travadinhas na primeira vez | É normal: os shaders estão sendo preparados. Melhora quando você passa de novo pelo mesmo lugar |
 
 Se continuar, [abra uma issue](https://github.com/sostenesfreitas/ocarina-recomp/issues) com a mensagem de erro e o modelo da sua placa de vídeo. Nunca envie arquivos do jogo.

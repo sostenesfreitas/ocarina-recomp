@@ -203,8 +203,8 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr));
 _Noreturn void plat_reexec(void);
 
 // A crash in this executable's own code (an access violation, an illegal instruction, a division by zero, a stack
-// overflow) goes to fn, which reports it and must end the process. Faults in other modules (drivers) are left to the
-// OS. The write-fault hook above runs first. On Windows abort() (a failed assert, std::terminate) and an invalid
+// overflow) goes to fn, which reports it and must end the process. Faults in other modules (drivers): see below the
+// struct. The write-fault hook above runs first. On Windows abort() (a failed assert, std::terminate) and an invalid
 // parameter to a C runtime function go there too, with the host frames in this executable: the C runtime ends the
 // process for both with 0xc0000409 and no exception.
 typedef struct {
@@ -215,8 +215,13 @@ typedef struct {
     uint64_t addr;             // its address when access >= 0
     int nframes;               // abort and invalid parameter: return addresses in this executable, innermost first
     uintptr_t frames[16];      // (rip is frames[0]); 0 for a fault, whose rip is exact
+    const char *module;        // NULL: the fault is in this executable; else the module's file name (offset is into it)
 } PlatCrash;
+// Windows: a fault in another module (the GPU driver's compiler, say) that nothing handles reaches fn too, from the last
+// chance filter, with module set: drivers may fault on purpose and handle it themselves, so only an unhandled one
+// counts. Linux leaves those to the OS.
 void plat_crash_hook(void (*fn)(const PlatCrash *c));
+void plat_crash_test_foreign(void);   // faults inside a system library, for TOTK_CRASH_TEST
 int plat_mem_read(uint64_t addr, void *out, size_t n);    // copies n bytes, 0 instead of faulting on unmapped memory
 int plat_mem_readable(uint64_t addr, uint64_t n);         // every page of [addr, addr + n) can be read; no fault
 void *plat_aligned_alloc(size_t size, size_t align);      // free with plat_aligned_free; NULL on failure

@@ -980,6 +980,11 @@ void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     fault_install();
 }
 
+void plat_crash_test_foreign(void) {
+    void *(*volatile set)(void *, int, size_t) = memset;   // libc's, through a pointer the compiler cannot inline
+    set((void *)(uintptr_t)16, 0, 64);
+}
+
 void plat_reexec(void) {
     static char args[16384];
     char *argv[256];

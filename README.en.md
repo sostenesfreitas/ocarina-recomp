@@ -110,6 +110,7 @@ It takes 30 minutes to 2 hours, and you can use your PC in the meantime. To upda
 |---|---|
 | "This game is not version 1.1.1" | Check that you chose the right, updated game |
 | The game opens and closes | Update your graphics driver and look at `ultima-partida-erros.log` in the install folder |
+| The game closed again in the same scene | When the crash was in the graphics driver's compiler, the pipeline goes into quarantine (`build\oot111\pipeline-quarantine.txt`): next time it is built without optimization and, if it crashes again, skipped. Delete the file after a driver update |
 | Stutter the first time | This is normal: shaders are being prepared. It gets better when you pass through the same place again |
 
 If the problem continues, [open an issue](https://github.com/sostenesfreitas/ocarina-recomp/issues) with the error message and your graphics card model. Never send game files.

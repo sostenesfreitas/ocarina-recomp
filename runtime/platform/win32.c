@@ -610,11 +610,51 @@ static void invalid_parameter(const wchar_t *expr, const wchar_t *func, const wc
     crash_from_runtime("invalid parameter to a C runtime function", 0xc0000417u);   // STATUS_INVALID_CRUNTIME_PARAMETER
 }
 
+// The last chance: an exception no handler took, in any module. crash_veh already reported (and ended the process for)
+// the listed faults in this executable, so what arrives here is mostly a fault in a DLL, such as the driver's shader
+// compiler (nvgpucomp64.dll), which before this ended the process with nothing in the log.
+static LONG WINAPI last_chance(EXCEPTION_POINTERS *ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    const char *what = code == EXCEPTION_ACCESS_VIOLATION ? "access violation"
+                     : code == EXCEPTION_ILLEGAL_INSTRUCTION ? "illegal instruction"
+                     : code == EXCEPTION_STACK_OVERFLOW ? "stack overflow"
+                     : code == EXCEPTION_IN_PAGE_ERROR ? "in-page error"
+                     : code == 0xe06d7363u ? "C++ exception" : "unhandled exception";
+    uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+    static char name[MAX_PATH];
+    HMODULE m = NULL;
+    uintptr_t base = 0;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)rip, &m) && m) {
+        base = (uintptr_t)m;
+        DWORD n = GetModuleFileNameA(m, name, sizeof name);
+        const char *slash = n ? strrchr(name, '\\') : NULL;
+        if (slash) memmove(name, slash + 1, strlen(slash));
+        if (!n) strcpy(name, "an unnamed module");
+    } else {
+        strcpy(name, "no module");
+    }
+    PlatCrash c = {what, (uint32_t)code, rip, base ? rip - base : 0, -1, 0};
+    c.module = m == GetModuleHandleW(NULL) ? NULL : name;
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
+        c.access = (int)ep->ExceptionRecord->ExceptionInformation[0], c.addr = ep->ExceptionRecord->ExceptionInformation[1];
+    crash_fn(&c);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     crash_fn = fn;
     AddVectoredExceptionHandler(0, crash_veh);
+    SetUnhandledExceptionFilter(last_chance);
     signal(SIGABRT, abort_signal);
     _set_invalid_parameter_handler(invalid_parameter);
+}
+
+void plat_crash_test_foreign(void) {
+    // ntdll's memset, called through a volatile pointer so the compiler cannot inline it, on an unmapped address
+    void *(*volatile set)(void *, int, size_t) = (void *(*)(void *, int, size_t))(void *)GetProcAddress(
+        GetModuleHandleW(L"ntdll.dll"), "memset");
+    if (set) set((void *)(uintptr_t)16, 0, 64);
 }
 
 // A fresh process gets a fresh layout: Windows places DLLs, heaps and thread stacks at random addresses. The parent

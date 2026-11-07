@@ -50,6 +50,7 @@
 #include "gfx.h"
 #include "host.h"
 #include "nvn_hmap.h"
+#include "pipe_journal.h"
 #include "platform/platform.h"
 #include "tex.h"
 
@@ -318,6 +319,14 @@ static int ensure_init(void) {
     if (P.dyn_wmask) P.dyn[P.n_dyn++] = VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT;
     if (P.dyn_a2c) P.dyn[P.n_dyn++] = VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT;
     cache_load(c);
+    {   // the journal and quarantine of pipelines that crashed the driver live beside the cache (pipe_journal.h)
+        char dir[sizeof P.cache_path];
+        snprintf(dir, sizeof dir, "%s", P.cache_path);
+        char *cut = plat_last_sep(dir);
+        if (cut) *cut = 0;
+        const char *q = cfg_get("TOTK_PIPE_QUARANTINE");
+        pj_open(cut ? dir : NULL, !(q && !strcmp(q, "0")));
+    }
     rt_log("vk_pipeline: max push descriptors %u; dynamic vertex input %d, depth clamp %d, polygon mode %d, blend enable %d, "
            "blend equation %d, write mask %d, alpha to coverage %d; cache %s",
            P.max_push, P.dyn_vi, P.dyn_clamp, P.dyn_poly, P.dyn_blend_en, P.dyn_blend_eq, P.dyn_wmask, P.dyn_a2c,
@@ -2054,8 +2063,32 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
     return missing;
 }
 
+static uint64_t pipe_journal_id(const VkPipeState *s, const GKey *k, uint32_t fs_off);   // after rec_fill
+
+// TOTK_CRASH_TEST=pipeline: the first pipeline built without strikes faults inside a system DLL, as a crash of the
+// driver's compiler would (tests/pipe_journal_test.py covers the journal itself; this covers the wiring in the game).
+static void crash_test(int strikes) {
+    static int on = -1;
+    static volatile int32_t done;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_CRASH_TEST");
+        on = e && !strcmp(e, "pipeline");
+    }
+    if (on && !strikes && !plat_xchg32(&done, 1)) {
+        rt_log("vk_pipeline: TOTK_CRASH_TEST=pipeline: faulting in a system DLL while compiling");
+        plat_crash_test_foreign();
+    }
+}
+
 static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
     if (s->gs && (l->set1 || !k->geometry_input || k->geometry_input > GFX_GEOMETRY_TRIANGLES_ADJACENCY)) return VK_NULL_HANDLE;
+    const uint64_t jid = pipe_journal_id(s, k, fs_off);
+    const int strikes = pj_strikes(jid);
+    if (strikes >= 2) {
+        rt_log("vk_pipeline: graphics pipeline %016llx is in quarantine (pipeline-quarantine.txt): not built, its draws are skipped",
+               (unsigned long long)jid);
+        return VK_NULL_HANDLE;
+    }
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE, gm = VK_NULL_HANDLE;
     uint64_t vw, fw;
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
@@ -2221,8 +2254,16 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         dy.dynamicStateCount = n, dy.pDynamicStates = mesh_dyn;
         pi.pVertexInputState = NULL, pi.pInputAssemblyState = NULL;
     }
+    if (strikes == 1) {   // it crashed the driver's compiler once: try the unoptimized path (pipe_journal.h)
+        pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        rt_log("vk_pipeline: graphics pipeline %016llx is in quarantine (pipeline-quarantine.txt): built without optimization",
+               (unsigned long long)jid);
+    }
     uint64_t p0 = perf_begin();
+    const int slot = pj_begin(jid, PJ_GRAPHICS, strikes);
+    crash_test(strikes);
     VkResult r = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
+    pj_end(slot);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
     if (r != VK_SUCCESS) {
         rt_log("vk_pipeline: vkCreateGraphicsPipelines failed (%d)", (int)r);
@@ -2699,6 +2740,19 @@ static void rec_fill(KeyRec *r, const VkPipeState *s) {
     legacy.vs = legacy.fs = legacy.gs = NULL;
     legacy.prim_restart = 0;   // dynamic state: the same pipeline either way
     memcpy(r->state, &legacy, sizeof r->state);
+}
+
+// The pipeline's id in the compile journal and the quarantine (pipe_journal.h): the key record's hash, which names the
+// shaders by input id and so is the same in every run, plus what the record leaves out but changes the pipeline: the
+// geometry and task shaders, the independent layouts and the fragment shader variant.
+static uint64_t pipe_journal_id(const VkPipeState *s, const GKey *k, uint32_t fs_off) {
+    KeyRec r;
+    rec_fill(&r, s);
+    uint64_t h = fnv(rec_hash(&r), &k->indep, sizeof k->indep);
+    h = fnv(h, &fs_off, sizeof fs_off);
+    if (s->gs) h = fnv(h, gfx_shader_input_id(s->gs), 32);
+    if (s->ts) h = fnv(h, gfx_shader_input_id(s->ts), 32);
+    return h;
 }
 
 // A pipeline was built for a draw: queue its record for the file. Caller holds P.lock.
@@ -3322,6 +3376,14 @@ static uint64_t big_cs_words(void) {
 
 static _Thread_local VkPipelineCache cs_build_cache;   // the big compute worker's own cache, see big_cs_worker
 static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
+    // Journal id (pipe_journal.h): the shader's input id, apart from the graphics ids by the seed.
+    const uint64_t jid = fnv(FNV0 ^ 'C', gfx_shader_input_id(cs), 32);
+    const int strikes = pj_strikes(jid);
+    if (strikes >= 2) {
+        rt_log("vk_pipeline: compute pipeline %016llx is in quarantine (pipeline-quarantine.txt): not built, its dispatches are skipped",
+               (unsigned long long)jid);
+        return VK_NULL_HANDLE;
+    }
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
     VkShaderModule m = make_module(code, words);
@@ -3344,8 +3406,15 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
         gfx_shader_local_size(cs, ls);
         if (ci.stage.pNext && ls[0] && ls[0] % vk_caps.sg_size == 0) ci.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
     }
+    if (strikes == 1 && !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
+        ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        rt_log("vk_pipeline: compute pipeline %016llx is in quarantine (pipeline-quarantine.txt): built without optimization",
+               (unsigned long long)jid);
+    }
     VkPipeline pipe = VK_NULL_HANDLE;
+    const int slot = pj_begin(jid, PJ_COMPUTE, strikes);
     if (vkCreateComputePipelines(P.device, cs_build_cache ? cs_build_cache : P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    pj_end(slot);
     vkDestroyShaderModule(P.device, m, NULL);
     return pipe;
 }
