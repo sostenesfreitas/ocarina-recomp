@@ -100,6 +100,7 @@ struct GfxShader {
     GfxShaderRes *res[GFX_RES_KINDS];
     int nres[GFX_RES_KINDS];
     uint32_t in_mask, out_mask;                            // user Locations of Input / Output variables
+    uint8_t out_comps[32];                                 // FS: components each output Location writes (reflect_out_comps)
     GfxShaderIo in[32], out[32];
     uint32_t local[3];
     GfxShaderGeometry geometry;
@@ -974,6 +975,70 @@ static int geometry_spirv(const GfxShader *s) {
     return !gs || (entry && capability && modes == 15);
 }
 
+// FS output Location l: the components (bit c = component c) the module ever stores, in out_comps[l]; 0xf when it cannot
+// tell. Maxwell leaves the channels a fragment shader does not write as they were, whatever the channel mask; Vulkan
+// writes undefined values there (zeros on NVIDIA). The pass that builds the 320x180 lighting target in Kokiri Forest
+// writes only its blue and alpha and keeps red and green from before: zeroed, the falling leaves, the canopy and the
+// grass lost their sunlight and rendered black (vk_pipeline.c target_wmask masks the channels). The translator declares
+// each output as a vec4 and stores single components through an OpAccessChain with a constant index; any other store
+// to an output (the whole vector, a dynamic index, a pointer passed on or copied) counts as all four.
+static void reflect_out_comps(GfxShader *s) {
+    enum { OP_VARIABLE_ = 59, OP_CONSTANT_ = 43, OP_DECORATE_ = 71, OP_STORE = 62, OP_ACCESS = 65, OP_IN_BOUNDS = 66,
+           OP_LOAD = 61, OP_NAME = 5, OP_ENTRY = 15, DEC_LOCATION = 30, DEC_COMPONENT = 31, SC_OUT = 3 };
+    memset(s->out_comps, 0xf, sizeof s->out_comps);
+    if (s->stage != GFX_STAGE_FS || s->words < 5) return;
+    const uint32_t *w = s->spirv;
+    uint64_t n = s->words;
+    uint32_t bound = w[3] < (1u << 20) ? w[3] : (1u << 20);
+    // per id: location + 1 of an output variable, or of the variable a single-component chain points into; that
+    // component + 1 for a chain (0: the whole variable); constant values; a Component decoration
+    int32_t *loc = calloc(bound, sizeof *loc), *vloc = calloc(bound, sizeof *vloc);
+    uint8_t *comp = calloc(bound, 1), *has_comp_dec = calloc(bound, 1);
+    uint32_t *cval = calloc(bound, sizeof *cval);
+    uint8_t *cknown = calloc(bound, 1);
+    uint8_t wr[32] = {0};
+    if (!loc || !vloc || !comp || !has_comp_dec || !cval || !cknown) goto out;
+    for (uint64_t i = 5; i < n;) {   // decorations, constants, output variables
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) goto out;
+        const uint32_t *a = w + i + 1;
+        if (op == OP_DECORATE_ && len >= 4 && a[0] < bound && a[1] == DEC_LOCATION) loc[a[0]] = (int32_t)a[2] + 1;
+        else if (op == OP_DECORATE_ && len >= 3 && a[0] < bound && a[1] == DEC_COMPONENT) has_comp_dec[a[0]] = 1;
+        else if (op == OP_CONSTANT_ && len == 4 && a[1] < bound) cval[a[1]] = a[2], cknown[a[1]] = 1;
+        else if (op == OP_VARIABLE_ && len >= 4 && a[1] < bound && a[2] == SC_OUT && loc[a[1]] > 0 && loc[a[1]] <= 32 &&
+                 !has_comp_dec[a[1]])
+            vloc[a[1]] = loc[a[1]];
+        i += len;
+    }
+    for (uint64_t i = 5; i < n;) {   // chains into outputs, stores through them
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        const uint32_t *a = w + i + 1;
+        if ((op == OP_ACCESS || op == OP_IN_BOUNDS) && len >= 4 && a[1] < bound && a[2] < bound && vloc[a[2]] > 0) {
+            vloc[a[1]] = vloc[a[2]];
+            comp[a[1]] = len == 5 && a[3] < bound && cknown[a[3]] && cval[a[3]] < 4 ? (uint8_t)(cval[a[3]] + 1) : 0;
+        } else if (op == OP_STORE && len >= 3 && a[0] < bound && vloc[a[0]] > 0) {
+            wr[vloc[a[0]] - 1] |= comp[a[0]] ? (uint8_t)(1u << (comp[a[0]] - 1)) : 0xf;
+        } else if (op != OP_LOAD && op != OP_DECORATE_ && op != OP_NAME && op != OP_ENTRY && op != OP_VARIABLE_ &&
+                   op != OP_STORE && op != OP_ACCESS && op != OP_IN_BOUNDS) {
+            // any other instruction that names an output pointer (a call, a copy, OpPhi of pointers): all components
+            for (uint32_t k = 0; k + 1 < len; k++)
+                if (a[k] < bound && vloc[a[k]] > 0) wr[vloc[a[k]] - 1] = 0xf;
+        }
+        i += len;
+    }
+    for (int l = 0; l < 32; l++)
+        if (s->out_mask >> l & 1) {
+            s->out_comps[l] = wr[l] ? wr[l] : 0xf;
+            static volatile int32_t logged;
+            if (s->out_comps[l] != 0xf && __atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 12)
+                rt_log("gfx_shader: fragment output %d writes only channels %s%s%s%s: the others keep their value", l,
+                       s->out_comps[l] & 1 ? "r" : "", s->out_comps[l] & 2 ? "g" : "", s->out_comps[l] & 4 ? "b" : "",
+                       s->out_comps[l] & 8 ? "a" : "");
+        }
+out:
+    free(loc), free(vloc), free(comp), free(has_comp_dec), free(cval), free(cknown);
+}
+
 // Interface Locations and the compute workgroup size from the module. Ids beyond 2^20 are ignored (Ryujinx modules stay
 // far below).
 static void reflect_spirv(GfxShader *s) {
@@ -1161,6 +1226,7 @@ static int reflect(GfxShader *s, int flags) {
             return 0;
         }
     reflect_spirv(s);
+    reflect_out_comps(s);
     if (s->geometry_source_passthrough) {
         if (s->geometry_position != 3) return 0;
         uint32_t locations = 0;
@@ -2370,6 +2436,7 @@ uint32_t gfx_shader_outputs(const GfxShader *s, GfxShaderIo io[32]) {
     return s->out_mask;
 }
 
+uint32_t gfx_shader_output_comps(const GfxShader *s, int loc) { return loc >= 0 && loc < 32 ? s->out_comps[loc] : 0xf; }
 int gfx_shader_is_mesh(const GfxShader *s) { return s->is_mesh; }
 int gfx_shader_is_task(const GfxShader *s) { return s->is_task; }
 void gfx_shader_local_size(const GfxShader *s, uint32_t local[3]) { memcpy(local, s->local, sizeof s->local); }

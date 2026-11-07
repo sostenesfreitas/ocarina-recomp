@@ -2055,6 +2055,7 @@ static int uses_src1(const VkPipeState *s) {
 static uint32_t target_wmask(const VkPipeState *s, int i) {
     uint32_t m = s->chmask.mask >> (4 * i) & 0xf;
     if (s->fs && !(gfx_shader_outputs(s->fs, NULL) >> i & 1)) m = 0;
+    if (s->fs) m &= gfx_shader_output_comps(s->fs, i);   // the channels it does not write stay, as on Maxwell
     if (i == 1 && s->fs && P.f_dual_src && uses_src1(s)) m = 0;   // output 1 is the second blend source (spirv_dual_source)
     return m;
 }
