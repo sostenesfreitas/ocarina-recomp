@@ -226,7 +226,7 @@ static void rec_apply(uint64_t b, const int32_t sl[2], const int32_t sr[2]) {
 static float mouse_sens = -1;              // TOTK_MOUSE_SENS, 0 = mouse camera off; live (cfg_version)
 static unsigned mouse_sens_seen;
 
-static float mouse_sens_get(void) {
+float input_mouse_sensitivity(void) {
     unsigned ver = cfg_version();
     if (mouse_sens >= 0 && ver == mouse_sens_seen) return mouse_sens;
     mouse_sens_seen = ver;
@@ -238,6 +238,7 @@ static float mouse_sens_get(void) {
 
 // The mouse camera as a right-stick sample, held for the whole presented frame. Under `lock`.
 static void mouse_camera(int32_t out[2]) {
+    if (input_camera_mouse_active()) { out[0] = out[1] = 0; return; }
     static uint64_t frame = ~0ull, t0;
     static int32_t held[2];
     uint64_t now = plat_now_ns();
@@ -252,7 +253,7 @@ static void mouse_camera(int32_t out[2]) {
         if (fr != frame) {
             double dt = age < 0.004 ? 0.004 : age > 0.1 ? 0.1 : age;
             ikb_mouse_take(&dx, &dy);
-            input_mouse_stick(dx, dy, dt, mouse_sens_get(), held);
+            input_mouse_stick(dx, dy, dt, input_mouse_sensitivity(), held);
             frame = fr;
             t0 = now;
         } else if (age > 0.1) {
@@ -489,7 +490,7 @@ static volatile int32_t g_menu;   // the in-game menu, the same way (input_menu)
 
 int input_cursor_allowed(void) {
     const char *in = cfg_get("TOTK_INPUT");
-    return g_block != 1 && g_menu != 1 && mouse_sens_get() > 0 && !(in && !strcmp(in, "none"));
+    return g_block != 1 && g_menu != 1 && input_mouse_sensitivity() > 0 && !(in && !strcmp(in, "none"));
 }
 
 void input_block(int on) {

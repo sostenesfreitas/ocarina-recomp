@@ -2,6 +2,9 @@
 #pragma once
 #include <stdint.h>
 
+float input_mouse_sensitivity(void);   // live TOTK_MOUSE_SENS, shared by free camera and item aiming
+int input_camera_mouse_active(void);   // Ocarina's direct camera hooks replace the mouse-as-stick path
+
 // Bits of libnx HidNpadButton (A=0 B=1 X=2 Y=3 StickL=4 StickR=5 L=6 R=7 ZL=8 ZR=9 Plus=10 Minus=11 Left=12 Up=13 Right=14
 // Down=15) and the stick directions (StickLLeft..Down 16-19, StickRLeft..Down 20-23, derived from the sticks).
 // Sticks are -32767..32767, up is +y. TOTK_INPUT=none reports no input. Callable from any thread.

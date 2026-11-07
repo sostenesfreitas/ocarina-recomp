@@ -83,7 +83,7 @@ uint32_t input_key_char(int key) {
 
 // ---- mouse camera: raw motion accumulated by the window thread, one stick sample per presented frame
 static volatile LONG mouse_dx, mouse_dy;   // raw counts since the last frame sample
-static volatile LONG cur_captured;         // cursor hidden and confined to the client area
+static volatile LONG cur_captured;         // cursor hidden and pinned inside the client area
 static volatile LONG cur_active;           // WM_ACTIVATEAPP: the window's application is active
 // Bits: CUR_REL, Esc or activation by a click on the title bar or border: until a client click; CUR_ESC, set with CUR_REL
 // by Esc (not when it was already set): closing the menu gives the capture back. One word, changed by one CAS.
@@ -99,7 +99,7 @@ static LONG rel_clear(LONG o) { (void)o; return 0; }
 static LONG rel_menu_closed(LONG o) { return o & CUR_ESC ? 0 : o; }
 static volatile LONG cur_suspend;          // F11 or a modal size or move loop under way
 static SRWLOCK cur_lock = SRWLOCK_INIT;    // serialises cursor_update (window thread, input_block callers)
-// Hide the cursor and confine it to the client area while the window is focused, not suspended, not behind a text entry
+// Hide the cursor and pin it to the client centre while the window is focused, not suspended, not behind a text entry
 // or the menu, and the mouse camera is on; release it otherwise. Safe from any thread.
 static void cursor_update(HWND h) {
     AcquireSRWLockExclusive(&cur_lock);
@@ -107,11 +107,22 @@ static void cursor_update(HWND h) {
                GetForegroundWindow() == h && !IsIconic(h);
     RECT r;
     POINT tl = {0, 0};
-    if (want && GetClientRect(h, &r) && ClientToScreen(h, &tl)) {
-        RECT clip = {tl.x, tl.y, tl.x + r.right, tl.y + r.bottom};
-        ClipCursor(&clip);
+    if (want && GetClientRect(h, &r) && r.right > 0 && r.bottom > 0 && ClientToScreen(h, &tl)) {
+        // Raw input supplies motion independently of the desktop pointer. A
+        // client-sized clip still lets that hidden pointer hover the taskbar
+        // reveal edge or an on-screen keyboard over the game. Keep it at one
+        // interior pixel instead; raw camera deltas remain unrestricted.
+        LONG x = tl.x + r.right / 2, y = tl.y + r.bottom / 2;
+        RECT clip = {x, y, x + 1, y + 1};
+        if (!ClipCursor(&clip)) {
+            if (cur_captured) ClipCursor(NULL);
+            InterlockedExchange(&cur_captured, 0);
+            ReleaseSRWLockExclusive(&cur_lock);
+            return;
+        }
         if (!cur_captured) { InterlockedExchange(&mouse_dx, 0); InterlockedExchange(&mouse_dy, 0); }
         InterlockedExchange(&cur_captured, 1);
+        SetCursor(NULL);
     } else {
         if (cur_captured) ClipCursor(NULL);
         InterlockedExchange(&cur_captured, 0);
@@ -173,7 +184,7 @@ int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res) {
     case WM_EXITSIZEMOVE:
         input_cursor_suspend(0);
         break;
-    case WM_CLOSE:
+    case WM_CLOSE: case WM_DESTROY:
         InterlockedExchange(&cur_active, 0);
         cursor_update(h);
         break;
