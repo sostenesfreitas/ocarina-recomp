@@ -710,7 +710,12 @@ void plat_aligned_free(void *p) { _aligned_free(p); }
 
 // ---- process
 
+// build_game.py --pgo gen: the profile runtime writes its .profraw from the CRT's atexit, which ExitProcess skips, so
+// it is written here. Weak: null in a build without -fprofile-generate.
+int __llvm_profile_write_file(void) __attribute__((weak));
+
 void plat_exit(int code) {
+    if (__llvm_profile_write_file) __llvm_profile_write_file();
     fflush(stdout);
     fflush(stderr);
     ExitProcess((UINT)code);

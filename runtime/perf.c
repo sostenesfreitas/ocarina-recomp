@@ -261,6 +261,31 @@ static void cpu_placement(void) {
     plat_process_affinity(on ? one : all);
 }
 
+// TOTK_GPU_CORES=N: the last N physical cores, with their SMT siblings, are kept for the GPU threads (recorder, replay,
+// present), and the guest threads stay off them. Fritchii v3 reported its two GPU threads on cores of their own as its
+// biggest single gain (Lake Hylia's worst moments from 29 to 54 fps). 0, the default, leaves placement to Windows: off
+// until measured here. Returns the mask a thread of that kind should take, 0 to leave it alone.
+// ponytail: assumes Windows numbers a core's logical processors adjacently (it does); plat_cpu_cores would have to
+// return per-core masks otherwise.
+uint64_t perf_thread_mask(int gpu) {
+    static int init;
+    static uint64_t gpu_mask, guest_mask;
+    if (!init) {
+        uint64_t all = 0, first = 0;
+        int n = cfg_int("TOTK_GPU_CORES"), cores = plat_cpu_cores(&all, &first);
+        if (n > 0 && cores > n) {
+            int per = __builtin_popcountll(all) / cores;
+            for (int i = 0; i < n * per; i++) gpu_mask |= 1ull << (63 - __builtin_clzll(all & ~gpu_mask));
+            guest_mask = all & ~gpu_mask;
+            rt_log("cpu: %d cores, %d logical processors: GPU threads on %#llx, guest threads on %#llx", cores,
+                   __builtin_popcountll(all), (unsigned long long)gpu_mask, (unsigned long long)guest_mask);
+        } else if (n > 0)
+            rt_log("cpu: TOTK_GPU_CORES=%d ignored (%d cores known)", n, cores);
+        __atomic_store_n(&init, 1, __ATOMIC_RELEASE);
+    }
+    return gpu ? gpu_mask : guest_mask;
+}
+
 void perf_present(uint64_t frame) {
     static uint64_t last, sum, max, n, win_start, ab_b;
     static int64_t win_prev[PERF_CNT_N];

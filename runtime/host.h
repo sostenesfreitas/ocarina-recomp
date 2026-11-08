@@ -48,6 +48,7 @@ enum { PERF_CNT_PIPE_ASYNC, PERF_CNT_PIPE_SKIP, PERF_CNT_TEX_UP, PERF_CNT_TEX_RE
        PERF_CNT_WB, PERF_CNT_WB_SKIP, PERF_CNT_N };
 void perf_count(int kind);
 void perf_present(uint64_t frame);
+uint64_t perf_thread_mask(int gpu);             // TOTK_GPU_CORES: affinity for a GPU (1) or guest (0) thread, 0 = none
 void perf_summary_flush(void);                  // prints the frame-time summary of the running period (exit); the 60 s lines come from perf_present
 void gfx_exit_log(void);                        // back end's lines for the exit summary (weak no-op in prof_win.c)
 int vk_backend_selftest(void);                  // replay write-back deduplication cases; failures (vk_backend.c)

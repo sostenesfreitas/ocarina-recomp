@@ -1452,6 +1452,7 @@ static void thread_main(void *p) {
     RtThread *t = p;
     tcur = t;
     t->tid = plat_thread_id();
+    if (perf_thread_mask(0)) plat_thread_affinity(NULL, perf_thread_mask(0));
     PlatIntr *self = ap_open_self();
     lock();
     t->hthr = self;
@@ -1523,6 +1524,7 @@ void kern_main_stack(uint64_t *base, uint64_t *size) {
 static void guest_main(void *p) {
     void (*fn)(Cpu *) = (void (*)(Cpu *))p;
     Cpu *c;
+    if (perf_thread_mask(0)) plat_thread_affinity(NULL, perf_thread_mask(0));
     kern_main_thread(&c);
     if (!setjmp(tcur->exit_jmp)) {
 #ifdef _WIN32   // the CRT needs this frame to validate longjmp when SetContextIpValidation is enabled

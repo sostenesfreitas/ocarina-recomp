@@ -31,6 +31,9 @@
 # free_cores = 0
 # Windows timer resolution of 1 ms for steadier frame pacing (0 = the Windows default).
 # timer_1ms = 1
+# Keep the last N physical cores for the GPU threads (recorder, replay, present) and the game's threads off them
+# (0 = Windows decides). Experimental: measure with TOTK_TRACE=perf before keeping it.
+# gpu_cores = 0
 
 # Shaders and pipelines.
 # Draws whose pipeline is still building: default waits on a reserved worker; draw is the previous scheduling.

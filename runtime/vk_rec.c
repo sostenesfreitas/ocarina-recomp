@@ -51,6 +51,7 @@ static void exec_packet(uint32_t op, void *p);
 static void rec_main(void *arg) {
     (void)arg;
     plat_thread_priority(rec_prio);
+    if (perf_thread_mask(1)) plat_thread_affinity(NULL, perf_thread_mask(1));
     uint64_t t = 0;
     for (;;) {
         uint64_t h = __atomic_load_n(&head, __ATOMIC_ACQUIRE);

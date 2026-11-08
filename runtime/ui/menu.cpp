@@ -760,6 +760,8 @@ static void tab_advanced(float scale) {
     opt_choice("TOTK_ASYNC_PREEMPT", UI_MENU_ASYNC_PREEMPT, preempt, 3, UI_MENU_ASYNC_PREEMPT_DESC);
     opt_toggle("TOTK_REPLAY_ASYNC", UI_MENU_REPLAY_ASYNC, UI_MENU_REPLAY_ASYNC_DESC);
     opt_toggle("TOTK_TIMER_1MS", UI_MENU_TIMER_1MS, UI_MENU_TIMER_1MS_DESC);
+    static const char *const gpu_cores[] = {"0", "1", "2", "3", "4"};
+    opt_choice_list("TOTK_GPU_CORES", UI_MENU_GPU_CORES, gpu_cores, gpu_cores, 5, UI_MENU_GPU_CORES_DESC);
 
     opt_group(UI_MENU_GROUP_SHADERS);
     static const UiTextId wait[] = {UI_MENU_PIPE_WAIT_DEFAULT, UI_MENU_PIPE_WAIT_DRAW};

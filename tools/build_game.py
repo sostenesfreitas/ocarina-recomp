@@ -718,6 +718,11 @@ def main():
     ap.add_argument('--pdb', action='store_true', help='Windows: CodeView line tables in every object and <out>/ocarina.pdb, for '
                     'Windows profilers and debuggers (Visual Studio, Superluminal, VTune). The generated code compiles again')
     ap.add_argument('--runtime', type=Path, help='runtime source directory (default runtime)')
+    ap.add_argument('--pgo', choices=['gen', 'use'],
+                    help='profile-guided optimisation of the generated code and the runtime. gen: an instrumented build '
+                         'that writes <out>/pgo/*.profraw when the game exits (play a representative stretch; needs '
+                         'MSYS2 compiler-rt). use: a build optimised by those profiles, merged with llvm-profdata (MSYS2 '
+                         'llvm). Use an --out of its own: the flags differ from the main build and would rebuild it')
     ap.add_argument('--full-build', action='store_true',
                     help="compile the generated C even where build/<version>'s objects could be reused")
     ap.add_argument('--skip-runtime', default='',
@@ -796,6 +801,27 @@ def main():
         RT_FLAGS.append('-gcodeview')
         GEN_FLAGS[:0] = ['-gcodeview', '-gline-tables-only']
         LINK_FLAGS.extend(['-Xlinker', '"--pdb=$builddir/ocarina.pdb"'])
+    if args.pgo:
+        # Experiment after Fritchii v3 (clang PGO, about 15% on every thread) and Hookshot (RX_PGO). The generated
+        # code dominates the CPU time, so it is instrumented too. The link needs the flag only to pull in the profile
+        # runtime (gen).
+        prof = out / 'pgo'
+        if args.pgo == 'gen':
+            pgo = [f'-fprofile-generate={cmd_path(prof)}']
+            LINK_FLAGS.extend(pgo)
+        else:
+            merged = prof / 'merged.profdata'
+            raws = sorted(prof.glob('*.profraw'))
+            if raws:
+                profdata = CLANG.with_name('llvm-profdata' + CLANG.suffix)
+                if not profdata.is_file():
+                    sys.exit(f'{profdata} not found: install ' + ('MSYS2 mingw-w64-ucrt-x86_64-llvm' if WIN else 'llvm'))
+                subprocess.run([str(profdata), 'merge', '-o', str(merged)] + [str(r) for r in raws], check=True)
+            elif not merged.is_file():
+                sys.exit(f'no {prof / "*.profraw"}: build with --pgo gen first and play')
+            pgo = [f'-fprofile-use={cmd_path(merged)}', '-Wno-profile-instr-unprofiled', '-Wno-profile-instr-out-of-date']
+        GEN_FLAGS.extend(pgo)
+        RT_FLAGS.extend(pgo)
     for tool in (CLANG, NINJA):
         if not tool.is_file():
             sys.exit(f'{tool} not found: install ' + ('MSYS2 UCRT64 clang, lld and ninja' if WIN else 'clang, lld and ninja')

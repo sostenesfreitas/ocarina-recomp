@@ -67,6 +67,7 @@ static int present_hold(void) {
 
 static void present_main(void *arg) {
     (void)arg;
+    if (perf_thread_mask(1)) plat_thread_affinity(NULL, perf_thread_mask(1));
     uint64_t last = 0, last_queued = 0;
     plat_mutex_lock(&pl);
     for (;;) {
@@ -212,6 +213,7 @@ static uint64_t submit_sync(const uint64_t *handles, int n, uint64_t submitted_t
 
 static void replay_main(void *arg) {
     (void)arg;
+    if (perf_thread_mask(1)) plat_thread_affinity(NULL, perf_thread_mask(1));
     perf_replay_thread();
     plat_mutex_lock(&rl);
     for (;;) {
