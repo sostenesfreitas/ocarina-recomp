@@ -73,11 +73,20 @@ typedef struct PoolRec {
     uint8_t *smap;                     // its mapping; offsets as in buf (from import_lo)
     uint32_t sgen;                     // gen_lock: every page write stamped up to this generation is in the shadow
     volatile uint8_t stouched;         // on the touched list: the GPU may use it in the submission being recorded
+    uint8_t slazy;                     // shadow mode: the shadow is made at the first vk_mem_resolve (shadow_late)
+    // Windowed shadow (a deferred shadow of a pool of OOT_POOL_WINDOW_MB or more, "windowed shadows" below): the pool
+    // itself never gets buf; win[k] is a record of its own (no index entry) shadowing [import_lo + k*WIN_STEP, +2 steps).
+    struct PoolRec **win;
+    uint32_t nwin;
 } PoolRec;
+#define WIN_SHIFT 25                    // windowed shadows: a window starts every 32 MiB and spans two steps
+#define WIN_STEP (1ull << WIN_SHIFT)
+static PoolRec *window_get(PoolRec *r, uint64_t addr, int create);
 
 static void mirror_forget(PoolRec *r);   // pool_lock exclusive: off the mirrored list
 static int shadow_on;                    // shadow mode: imported pools get shadow storage instead (vk_mem_class_log)
 static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size);
+static void shadow_late(PoolRec *r);
 static void shadow_touch(PoolRec *r);
 static void shadow_forget(PoolRec *r);
 static void mirror_retiring(PoolRec *r);  // vk_pool_fini: kept until mirror_retire (or vk_mem_shutdown)
@@ -297,6 +306,9 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
     if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
+    for (uint32_t k = 0; k < r->nwin; k++)
+        if (r->win[k]) destroy_rec(c, r->win[k]);
+    free(r->win);
     free(r->pt);
     free(r);
 }
@@ -344,6 +356,9 @@ int vk_pool_init(pool_t *p) {
         }
     }
     if (!ok) { free(r->pt); free(r); return 0; }
+    if (cfg_get("OOT_POOL_LOG"))
+        rt_log("vk: pool %#llx+%#llx flags %#x kind %d", (unsigned long long)r->lo, (unsigned long long)r->size, r->flags,
+               r->kind);
     plat_mutex_lock(&pool_lock);
     if (!++storage_serial) ++storage_serial;
     r->storage_serial = storage_serial;
@@ -386,6 +401,8 @@ void vk_pool_fini(pool_t *p) {
     if (r->kind == POOL_IMPORT) vk_texture_descriptors_retire(r->lo, r->size, 0);
     else if (r->kind == POOL_PHYS) vk_texture_descriptors_retire(0, 0, r->storage_serial);
     if (r->smap) shadow_forget(r);
+    for (uint32_t k = 0; k < r->nwin; k++)
+        if (r->win[k] && r->win[k]->smap) shadow_forget(r->win[k]);
     if (r->kind == POOL_IMPORT) mem_thaw(r->lo, r->size);   // the storage goes back to the guest writable
     // Images cut from this range go first; a used buffer or memory waits until the GPU is done with it, since the
     // guest gets the storage back when this returns.
@@ -455,7 +472,7 @@ static int resolve_check_on(void) {
     return on;
 }
 
-static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out);
+static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out, int create);
 
 int vk_mem_inspect(uint64_t addr, uint64_t size, VkMemInspect *out) {
     if (!out) return 0;
@@ -584,20 +601,61 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
         if (shadow_on && h->pool && !((PoolRec *)h->pool)->stouched) shadow_touch(h->pool);
         if (resolve_check_on()) {
             VkMemSpan s;
-            if (!resolve_locked(addr, size, &s) || memcmp(&s, out, sizeof s))
+            if (!resolve_locked(addr, size, &s, 1) || memcmp(&s, out, sizeof s))
                 rt_fatal("vk: resolve cache of 0x%llx differs from the pool index", (unsigned long long)addr);
         }
         return 1;
     }
-    return resolve_locked(addr, size, out);
+    return resolve_locked(addr, size, out, 1);
+}
+
+// The same lookup without making a deferred shadow: for callers that only ask what backs an address (an image looking
+// for pool memory to alias), so a pool the GPU only reads textures from never gets one.
+int vk_mem_resolve_existing(uint64_t addr, uint64_t size, VkMemSpan *out) {
+    return resolve_locked(addr, size, out, 0);
 }
 
 // The pool index lookup under the lock; a non-overlapped import or physical pool goes into the address's cache slot.
-static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
+static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out, int create) {
     memset(out, 0, sizeof *out);
     plat_mutex_lock_shared(&pool_lock);
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, size);
     PoolRec *r = e ? e->buf : NULL;
+    if (r && r->nwin) {   // windowed shadows: the window that holds addr and at least a step after it
+        PoolRec *w = window_get(r, addr, create);
+        int ok = w && addr + size <= w->import_hi;
+        if (w && !ok) {
+            static volatile int32_t lines;
+            if (plat_inc32(&lines) <= 4)
+                rt_log("mem: %#llx+%#llx runs past its shadow window (%#llx+%#llx): left unbacked",
+                       (unsigned long long)addr, (unsigned long long)size, (unsigned long long)w->import_lo,
+                       (unsigned long long)w->size);
+        }
+        if (ok) {
+            int i = (int)(e - pool_index.e);
+            if ((i == 0 || pool_index.maxhi[i - 1] <= e->lo) && (i + 1 == pool_index.n || pool_index.e[i + 1].lo >= e->hi)) {
+                // The cache slot covers only the step whose lookups pick this window, so a hit and the locked lookup
+                // agree (TOTK_RESOLVE_CHECK).
+                uint64_t s_lo = r->import_lo + ((addr - r->import_lo) & ~(WIN_STEP - 1)), s_hi = s_lo + WIN_STEP;
+                ResolveHit *h = rhit_slot(addr);
+                h->gen = __atomic_load_n(&pool_gen, __ATOMIC_RELAXED);
+                h->lo = s_lo > e->lo ? s_lo : e->lo, h->hi = s_hi < e->hi ? s_hi : e->hi;
+                h->buf = w->buf, h->cls = rec_class(w), h->base = w->import_lo, h->end = w->import_hi;
+                h->alloc = NULL, h->pool = w;
+            }
+            out->cls = rec_class(w);
+            out->pool = w;
+            out->buffer = w->buf;
+            out->offset = addr - w->import_lo;
+            out->avail = w->import_hi - addr;
+            if (w->smap && !w->stouched) shadow_touch(w);
+            if (!r->used) plat_xchg32(&r->used, 1);
+        }
+        plat_mutex_unlock_shared(&pool_lock);
+        if (!ok) memset(out, 0, sizeof *out);
+        return ok;
+    }
+    if (create && r && r->kind == POOL_IMPORT && r->slazy && !__atomic_load_n(&r->buf, __ATOMIC_ACQUIRE)) shadow_late(r);
     int ok = 0;
     if (r && (r->kind == POOL_IMPORT ? r->buf != VK_NULL_HANDLE : r->kind == POOL_PHYS)) {
         int i = (int)(e - pool_index.e);
@@ -678,7 +736,7 @@ uint64_t vk_mem_gen(void) {
 
 int vk_mem_class_of(uint64_t addr) {
     VkMemSpan m;
-    return vk_mem_resolve(addr, 1, &m) ? m.cls : VK_MCLS_NONE;
+    return vk_mem_resolve_existing(addr, 1, &m) ? m.cls : VK_MCLS_NONE;
 }
 
 // ---------------------------------------------------------------- census
@@ -1063,9 +1121,98 @@ static int nspend, cspend;
 static int64_t s_live_n, s_live_bytes;            // shadow_lock
 static uint64_t s_syncs, s_copied, s_queries, s_untracked, s_wb_bytes, s_ticks;   // shadow_lock: since the last log
 
+// Deferred (the default; TOTK_SHADOW_LAZY=0 makes every shadow at MemoryPoolInitialize): most CPU-visible pools only
+// hold textures, which the GPU reads from images of their own, and a shadow of them is host memory spent for nothing
+// (Ocarina of Time: 2.9 GB of such pools at the title screen, enough to run a 16 GB PC out of memory). A pool gets its
+// shadow at its first vk_mem_resolve, under pool_lock shared: the copy then holds the guest bytes as of that moment and
+// sgen the generation, as at MemoryPoolInitialize. r->buf is stored last, so a reader that sees it sees the rest.
+static int shadow_lazy_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_SHADOW_LAZY");
+        on = !e || !*e || strcmp(e, "0");
+    }
+    return on;
+}
+
+static PlatMutex lazy_lock = PLAT_MUTEX_INIT;   // after pool_lock; before shadow_lock and gen_lock
+static int shadow_make(VkCtx *c, PoolRec *r);
+
+// ---------------------------------------------------------------- windowed shadows
+// A deferred shadow copies the whole pool at its first buffer use. Ocarina of Time creates a 2.4 GB CPU-cached pool
+// when the world loads and binds one 8 MiB storage range of it: the whole-pool shadow took 2.4 GB of host memory and
+// its VRAM mirror 2.4 GB more, which ran a 16 GB PC with an 8 GB GPU out of both. A pool of OOT_POOL_WINDOW_MB or more
+// (default 256; 0 turns windows off) gets shadows of windows instead, made on demand: window k covers
+// [import_lo + k*WIN_STEP, + 2*WIN_STEP), so an address in step k has at least one step (32 MiB) after it in window k,
+// and every lookup of that address (binding, write-back) picks window k. Windows overlap by one step, like overlapping
+// pools: each keeps its own copy, synced from guest memory before each submission. A window is a record with no index
+// entry, so mirror_create does not find it in the index and it gets no VRAM mirror: the GPU reads its host-visible
+// shadow, a few MiB a frame here.
+static uint64_t window_min(void) {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char *e = cfg_get("OOT_POOL_WINDOW_MB");
+        v = e && *e ? (int64_t)atoll(e) << 20 : 256ll << 20;
+    }
+    return (uint64_t)v;
+}
+
 static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     r->import_lo = addr & ~0xfffull;
     r->import_hi = (addr + size + 0xfff) & ~0xfffull;
+    if (shadow_lazy_on()) {
+        uint64_t n = r->import_hi - r->import_lo, min = window_min();
+        if (min && n >= min) {
+            r->nwin = (uint32_t)((n + WIN_STEP - 1) >> WIN_SHIFT);
+            r->win = calloc(r->nwin, sizeof *r->win);
+            if (!r->win) r->nwin = 0;
+        }
+        r->slazy = 1;
+        return 1;
+    }
+    return shadow_make(c, r);
+}
+
+static void shadow_late(PoolRec *r) {
+    plat_mutex_lock(&lazy_lock);
+    if (!r->buf && r->slazy && !shadow_make(vk_ctx(), r)) r->slazy = 0;   // failed: stays unbacked, as before
+    plat_mutex_unlock(&lazy_lock);
+}
+
+// pool_lock held (shared at least): the window of a windowed pool that addr's lookups use; made when create is set.
+static PoolRec *window_get(PoolRec *r, uint64_t addr, int create) {
+    if (addr < r->import_lo) return NULL;
+    uint64_t k = (addr - r->import_lo) >> WIN_SHIFT;
+    if (k >= r->nwin) return NULL;
+    PoolRec *w = __atomic_load_n(&r->win[k], __ATOMIC_ACQUIRE);
+    if (w || !create) return w;
+    plat_mutex_lock(&lazy_lock);
+    w = r->win[k];
+    if (!w && (w = calloc(1, sizeof *w))) {
+        w->key = r->key;
+        w->storage_serial = r->storage_serial;
+        w->kind = POOL_IMPORT;
+        w->flags = r->flags;
+        w->import_lo = r->import_lo + (k << WIN_SHIFT);
+        w->import_hi = w->import_lo + 2 * WIN_STEP < r->import_hi ? w->import_lo + 2 * WIN_STEP : r->import_hi;
+        w->lo = w->import_lo, w->size = w->import_hi - w->import_lo;
+        if (shadow_make(vk_ctx(), w)) {
+            static volatile int32_t lines;
+            if (plat_inc32(&lines) <= 8)
+                rt_log("mem: pool %#llx+%#llx: window %llu shadowed, %#llx+%#llx (the pool is %u windows; "
+                       "OOT_POOL_WINDOW_MB=0 shadows it whole)", (unsigned long long)r->lo, (unsigned long long)r->size,
+                       (unsigned long long)k, (unsigned long long)w->import_lo, (unsigned long long)w->size, r->nwin);
+            __atomic_store_n(&r->win[k], w, __ATOMIC_RELEASE);
+        } else {
+            free(w);
+            w = NULL;
+        }
+    }
+    plat_mutex_unlock(&lazy_lock);
+    return w;
+}
+
+static int shadow_make(VkCtx *c, PoolRec *r) {
     uint64_t n = r->import_hi - r->import_lo;
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = pool_usage(c),
                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
@@ -1074,11 +1221,12 @@ static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
                                   .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                   .preferredFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT};
     VmaAllocationInfo info;
-    VkResult res = vmaCreateBuffer(c->vma, &bi, &ai, &r->buf, &r->salloc, &info);
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkResult res = vmaCreateBuffer(c->vma, &bi, &ai, &buf, &r->salloc, &info);
     if (res != VK_SUCCESS) {
-        rt_log("vk: pool %#llx+%#llx: shadow allocation failed (%d)", (unsigned long long)addr, (unsigned long long)size,
-               (int)res);
-        r->buf = VK_NULL_HANDLE, r->salloc = NULL;
+        rt_log("vk: pool %#llx+%#llx: shadow allocation failed (%d)", (unsigned long long)r->lo,
+               (unsigned long long)r->size, (int)res);
+        r->salloc = NULL;
         return 0;
     }
     r->smap = info.pMappedData;
@@ -1086,6 +1234,7 @@ static int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     r->sgen = gen_now;   // the copy below holds every write stamped so far; later stamps are copied again
     plat_mutex_unlock(&gen_lock);
     memcpy(r->smap, (const void *)(uintptr_t)r->import_lo, n);
+    __atomic_store_n(&r->buf, buf, __ATOMIC_RELEASE);
     plat_mutex_lock(&shadow_lock);
     s_live_n++, s_live_bytes += (int64_t)n;
     plat_mutex_unlock(&shadow_lock);
@@ -1193,6 +1342,7 @@ void vk_gpu_written(uint64_t addr, uint64_t size) {
         plat_mutex_lock_shared(&pool_lock);
         const pidx_ent *e = pidx_find(&pool_index, addr, size);
         PoolRec *r = e ? e->buf : NULL;
+        if (r && r->nwin) r = window_get(r, addr, 0);   // the window the binding at addr used
         plat_mutex_lock(&shadow_lock);
         if (r && r->smap && addr >= r->import_lo && addr + size <= r->import_hi) {
             mem_thaw(addr, size);
@@ -1571,6 +1721,23 @@ static void mirror_create(PoolRec *r) {
         char why[128];
         snprintf(why, sizeof why, "its %.1f MiB mirror passes the mirror cap (%.0f of %.0f MiB mirrored)", n / 1048576.0,
                  m_live_bytes / 1048576.0, mirror_cap / 1048576.0);
+        return refuse(r, MR_BUDGET, why);
+    }
+    // OOT_MIRROR_MAX_PCT=<p> (default 0: no cap): mirrors together stay under p% of the VRAM budget. A pool is mirrored
+    // whole at its first buffer bind, texture bytes included, while each sampled texture also has an image of its own
+    // (ASTC decoded to RGBA8: 4-16x its storage), so on an 8 GB card mirrors can take the room textures need.
+    static int64_t mirror_pct = -1;
+    if (mirror_pct < 0) {
+        const char *e = cfg_get("OOT_MIRROR_MAX_PCT");
+        mirror_pct = e && *e ? atoll(e) : 0;
+        if (mirror_pct < 0 || mirror_pct > 100) mirror_pct = 0;
+        if (mirror_pct) rt_log("mem: mirrors capped at %lld%% of the VRAM budget (OOT_MIRROR_MAX_PCT)", (long long)mirror_pct);
+    }
+    if (mirror_pct && budget &&
+        (uint64_t)__atomic_load_n(&m_live_bytes, __ATOMIC_RELAXED) + n > budget / 100 * (uint64_t)mirror_pct) {
+        char why[128];
+        snprintf(why, sizeof why, "its %.1f MiB mirror would pass OOT_MIRROR_MAX_PCT (%lld%% of %.0f MiB)", n / 1048576.0,
+                 (long long)mirror_pct, budget / 1048576.0);
         return refuse(r, MR_BUDGET, why);
     }
     plat_mutex_lock(&gen_lock);
