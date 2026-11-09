@@ -521,6 +521,16 @@ void vk_present_capture(int on) {
     plat_rmutex_unlock(&g_pl);
 }
 
+static void save_capture(const char *path);
+// LOCAL (AMD, debug): OOT_SHOT_SWAPCHAIN: the last captured swapchain image as a PNG, under the present lock. 0: no capture yet.
+int vk_present_save_capture(const char *path) {
+    plat_rmutex_lock(&g_pl);
+    int ok = g_cap_valid;
+    if (ok) save_capture(path);
+    plat_rmutex_unlock(&g_pl);
+    return ok;
+}
+
 int vk_present_captured(const uint8_t **px, int *w, int *h, VkFormat *fmt) {
     plat_rmutex_lock(&g_pl);
     int ok = g_cap_valid;

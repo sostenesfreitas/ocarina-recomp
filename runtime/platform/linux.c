@@ -939,11 +939,13 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 // write-fault hook first (memory.c thaws a frozen region); a fault in this executable's code then goes to the crash
 // hook (main.c); anything else gets the default action. Runs on the thread's signal stack.
 static int (*fault_hook)(uint64_t addr);
+static int (*access_hook)(uint64_t addr, int write);   // LOCAL (AMD): read and write faults, first
 static void (*crash_fn)(const PlatCrash *c);
 
 static void fault_handler(int sig, siginfo_t *si, void *uc) {
     ucontext_t *u = uc;
     long err = u->uc_mcontext.gregs[REG_ERR];
+    if (sig == SIGSEGV && access_hook && access_hook((uint64_t)(uintptr_t)si->si_addr, (err & 2) != 0)) return;
     if (sig == SIGSEGV && fault_hook && (err & 2) && fault_hook((uint64_t)(uintptr_t)si->si_addr)) return;
     uintptr_t rip = (uintptr_t)u->uc_mcontext.gregs[REG_RIP];
     Dl_info at, self;
@@ -981,6 +983,11 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
 void plat_crash_note(const char *note) { (void)note; }
 void plat_crash_file(const char *path) { (void)path; }
 
+void plat_mem_access_hook(int (*fn)(uint64_t addr, int write)) {   // LOCAL (AMD)
+    access_hook = fn;
+    fault_install();
+}
+
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {
     crash_fn = fn;
     fault_install();
@@ -1006,6 +1013,11 @@ void plat_reexec(void) {
 int plat_mem_read(uint64_t addr, void *out, size_t n) {
     struct iovec local = {out, n}, remote = {(void *)(uintptr_t)addr, n};
     return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)n;
+}
+
+int plat_mem_pages_readable(const uint64_t *pages, int n, uint8_t *ok) {   // LOCAL (AMD): see win32.c
+    (void)pages, (void)n, (void)ok;
+    return 0;
 }
 
 int plat_mem_readable(uint64_t addr, uint64_t n) {

@@ -34,6 +34,8 @@ enum { MS_NONE, MS_ON, MS_REFUSED };
 
 typedef struct { struct PoolRec *phys; uint64_t off; } VPage;   // virtual page -> physical pool and offset
 
+typedef struct LzRange { uint64_t off, size, fence; } LzRange;   // LOCAL (AMD): a GPU-written byte range of a mirror
+                                                                  // waiting for a CPU access (offsets from import_lo)
 typedef struct PoolRec {
     const pool_t *key;
     uint64_t storage_serial;          // unique backing lifetime; virtual aliases use their physical record's serial
@@ -74,6 +76,14 @@ typedef struct PoolRec {
     uint8_t *smap;                     // its mapping; offsets as in buf (from import_lo)
     uint32_t sgen;                     // gen_lock: every page write stamped up to this generation is in the shadow
     volatile uint8_t stouched;         // on the touched list: the GPU may use it in the submission being recorded
+    // LOCAL (AMD): on-demand write-back ("lazy write-back" below). lz, eg, pbits: lazy_lock.
+    uint8_t *mmap;                     // MS_ON: the mirror's host mapping when its memory is host-visible, else NULL
+    uint8_t lazy;                      // GPU writes into the mirror wait for a CPU access before going back to guest memory
+    LzRange *lz;                       // pending GPU-written ranges, sorted, merged
+    int nlz, clz;
+    LzRange *eg;                       // page ranges the CPU touched once: written back eagerly from then on
+    int neg, ceg;
+    uint8_t *pbits;                    // one bit per page of [import_lo, import_hi): PAGE_NOACCESS for a pending range
 } PoolRec;
 
 static void mirror_forget(PoolRec *r);   // pool_lock exclusive: off the mirrored list
@@ -99,6 +109,7 @@ static int nphys, cap_phys;
 static int32_t n_imports, n_import_failures;
 static PFN_vkGetMemoryHostPointerPropertiesEXT p_host_props;
 
+int vk_mem_pages_on(void);   // LOCAL (AMD): below
 static VkBufferUsageFlags pool_usage(const VkCtx *c) {
     VkBufferUsageFlags u = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                            VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
@@ -108,6 +119,7 @@ static VkBufferUsageFlags pool_usage(const VkCtx *c) {
     if (c->has_transform_feedback)
         u |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
     if (c->has_conditional_rendering) u |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+    if (vk_mem_pages_on()) u |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;   // LOCAL (AMD): OOT_GLOOP_PAGES
     return u;
 }
 
@@ -120,6 +132,8 @@ static int memory_type(const VkCtx *c, uint32_t bits, VkMemoryPropertyFlags want
 }
 
 // CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host).
+static void pt_init(VkCtx *c);                  // LOCAL (AMD): OOT_GLOOP_PAGES, below
+static void pt_set_pool(PoolRec *r, int clear);
 static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     if (shadow_on) return shadow_pool(c, r, addr, size);
     if (!p_host_props)
@@ -179,6 +193,8 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     VkImportMemoryHostPointerInfoEXT im = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
                                            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                            .pHostPointer = (void *)(uintptr_t)r->import_lo};
+    VkMemoryAllocateFlagsInfo fl = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    if (vk_mem_pages_on()) im.pNext = &fl;   // LOCAL (AMD): OOT_GLOOP_PAGES: the import has a device address
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &im, .allocationSize = n,
                                .memoryTypeIndex = (uint32_t)type};
     if ((res = vkAllocateMemory(c->device, &ai, NULL, &r->mem)) != VK_SUCCESS ||
@@ -209,6 +225,7 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
         }
     }
     plat_inc32(&n_imports);
+    pt_init(c), pt_set_pool(r, 0);   // LOCAL (AMD): OOT_GLOOP_PAGES
     return 1;
 }
 
@@ -220,6 +237,80 @@ static uint32_t import_window(const PoolRec *r, uint64_t off, uint64_t *start, u
     *start = w * r->wstep;
     *end = n - *start < r->wlen ? n : *start + r->wlen;
     return (uint32_t)w;
+}
+
+// LOCAL (AMD): OOT_GLOOP_PAGES: a GPU page table, 4 KiB guest page -> device address of its bytes (the pool's mirror
+// when it has one, else its import window), so a guarded helper (spv_guarded_loop.h) translates a guest address in one
+// lookup instead of testing up to 95 candidates. Host-visible device memory written by the CPU under PT.lock; the GPU
+// reads it through its device address, which vk_c0_fill writes at NVN2_C0_PAGES. Guest addresses from PT_N pages on,
+// pools that are not imports, and pools without an entry yet fall back to the loop (entry 0). An entry changes while
+// the GPU may read the table only towards an equivalent buffer (import -> mirror of the same bytes) or to 0.
+enum { PT_SHIFT = 12, PT_N = 1 << 22 };   // 16 GiB of guest addresses, 32 MiB of table
+static struct { VkBuffer buf; VmaAllocation alloc; uint64_t *map; VkDeviceAddress addr; int failed; PlatMutex lock; }
+    PT = {.lock = PLAT_MUTEX_INIT};
+
+int vk_mem_pages_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("OOT_GLOOP_PAGES");
+        on = e && *e ? *e == '1' : vk_caps.amd;   // default on AMD (spv_guarded_loop.h decides the same)
+        if (on) rt_log("mem: GPU page table for the guarded helpers (OOT_GLOOP_PAGES%s): %d pages of %d KiB",
+                       e && *e ? "" : ", default on AMD", PT_N, 1 << (PT_SHIFT - 10));
+    }
+    return on;
+}
+
+static VkDeviceAddress buf_device_addr(VkCtx *c, VkBuffer b) {
+    VkBufferDeviceAddressInfo da = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b};
+    return vkGetBufferDeviceAddress(c->device, &da);
+}
+
+static void pt_init(VkCtx *c) {
+    if (PT.buf || PT.failed || !vk_mem_pages_on()) return;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (uint64_t)PT_N * 8,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                             .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+                                  .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                  .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    VmaAllocationInfo info;
+    if (vmaCreateBuffer(c->vma, &bi, &ai, &PT.buf, &PT.alloc, &info) != VK_SUCCESS || !info.pMappedData) {
+        PT.failed = 1;
+        rt_log("mem: GPU page table: allocation failed; the guarded helpers keep the loop");
+        return;
+    }
+    PT.map = info.pMappedData;
+    memset(PT.map, 0, (size_t)PT_N * 8);
+    PT.addr = buf_device_addr(c, PT.buf);
+}
+
+uint64_t vk_mem_pages_addr(uint32_t *shift, uint32_t *entries) {
+    if (shift) *shift = PT_SHIFT;
+    if (entries) *entries = PT_N;
+    return PT.map ? PT.addr : 0;
+}
+
+// The pool's pages: towards its mirror (MS_ON), else its import window; clear: no entry (the pool goes away).
+static void pt_set_pool(PoolRec *r, int clear) {
+    if (!PT.map || r->kind != POOL_IMPORT || !r->buf) return;
+    VkCtx *c = vk_ctx();
+    uint64_t n = r->import_hi - r->import_lo;
+    VkDeviceAddress mb = !clear && r->mstate == MS_ON && r->mbuf ? buf_device_addr(c, r->mbuf) : 0, wa[64];
+    uint32_t nw = r->nwin ? r->nwin : 1;
+    if (nw > 64) return;
+    if (!clear) for (uint32_t w = 0; w < nw; w++) wa[w] = buf_device_addr(c, r->nwin ? r->wbuf[w] : r->buf);   // a partial mirror leaves pages on the import
+    plat_mutex_lock(&PT.lock);
+    for (uint64_t off = 0; off < n; off += 1ull << PT_SHIFT) {
+        uint64_t va = r->import_lo + off, e = 0;
+        if (va >> PT_SHIFT >= PT_N) break;
+        if (!clear) {
+            if (mb && off >= r->mirror_lo && off < r->mirror_hi) e = mb + (off - r->mirror_lo);   // the mirrored window
+            else if (r->nwin) { uint64_t ws, we; uint32_t w = import_window(r, off, &ws, &we); e = wa[w] + (off - ws); }
+            else e = wa[0] + off;
+        }
+        PT.map[va >> PT_SHIFT] = e;
+    }
+    plat_mutex_unlock(&PT.lock);
 }
 
 // Physical pool: device-local memory of the pool size that both buffers and optimal-tiling images can be bound to.
@@ -288,6 +379,7 @@ static PoolRec *phys_find(const pool_t *key) {
 }
 
 static void destroy_rec(VkCtx *c, PoolRec *r) {
+    pt_set_pool(r, 1);   // LOCAL (AMD): OOT_GLOOP_PAGES
     if (r->mbuf) vmaDestroyBuffer(c->vma, r->mbuf, r->malloc_);
     if (r->salloc) vmaDestroyBuffer(c->vma, r->buf, r->salloc), r->buf = VK_NULL_HANDLE;
     if (r->nwin) {   // wbuf[0] is buf
@@ -1102,6 +1194,7 @@ static void bfence_add(uint64_t lo, uint64_t hi, uint64_t fence) {
     plat_mutex_unlock(&bfence_lock);
 }
 
+static uint64_t lz_written_fence(uint64_t addr, uint64_t size);   // LOCAL (AMD): below, with the lazy write-back
 uint64_t vk_mem_written_fence(uint64_t addr, uint64_t size) {
     if (!size) return 0;
     uint64_t end = addr + size, f = 0;
@@ -1115,6 +1208,10 @@ uint64_t vk_mem_written_fence(uint64_t addr, uint64_t size) {
         for (int i = 0; i < nspend; i++)
             if (spend[i].lo < end && spend[i].hi > addr && spend[i].fence > f) f = spend[i].fence;
         plat_mutex_unlock(&shadow_lock);
+    }
+    {   // LOCAL (AMD): OOT_MIRROR_LAZY_WB: a lazily written mirror reaches guest memory on the CPU's access, after its fence
+        uint64_t lf = lz_written_fence(addr, size);
+        if (lf > f) f = lf;
     }
     return f;
 }
@@ -1428,6 +1525,12 @@ static int mirror_verify;
 static int mirror_gap = 2;             // pre-snap: hot pools at most this many 2 MiB regions apart share one query
 static PoolRec **mlist;                // pool_lock: mirrored pools by import_lo
 static int nm, mcap;
+static int lazy_on;                    // LOCAL (AMD): OOT_MIRROR_LAZY_WB ("lazy write-back" below)
+static volatile int64_t lz_nohost;
+static int lz_fault(uint64_t a, int write);
+static void lz_thaw(uint64_t a, uint64_t n);
+static void lz_forget(PoolRec *r);
+static void lz_upload_add(PoolRec *r, uint64_t off, uint64_t size);
 static uint32_t msub;                  // replay: number of the submission being recorded
 static uint32_t mepoch;                // replay: its write-watch snapshot epoch (vk_texture_epoch)
 typedef struct { PoolRec *r; uint64_t off, size; } MRange;
@@ -1459,6 +1562,15 @@ static void mirror_mode(int discrete, uint32_t vendor) {
     }
     vk_mirror_on = mode > 0;
     mirror_verify = mode == 2;
+    {   // LOCAL (AMD): OOT_MIRROR_LAZY_WB (default off): GPU writes into mirrors go back to guest memory on CPU access
+        const char *lz = getenv("OOT_MIRROR_LAZY_WB");
+        lazy_on = vk_mirror_on && !mirror_verify && lz && *lz && *lz != '0';
+        if (lazy_on) {
+            plat_mem_access_hook(lz_fault);
+            mem_thaw_hook(lz_thaw);
+            rt_log("mem: lazy write-back: GPU writes into mirrors reach guest memory on the first CPU access (OOT_MIRROR_LAZY_WB)");
+        }
+    }
     const char *g = cfg_get("TOTK_MIRROR_GAP");
     mirror_gap = g && *g ? atoi(g) : 2;
     if (mirror_gap < 0) mirror_gap = 0;
@@ -1499,6 +1611,43 @@ static int range_cmp(const void *x, const void *y) {
     return a->off < b->off ? -1 : a->off > b->off;
 }
 
+// LOCAL (AMD): OOT_MIRROR_OVERSIZE=1: a pool larger than maxBufferSize (a windowed import, nwin > 0) gets its device-local
+// mirror anyway: one buffer of the mirrored window's size, as v0.2.1 made it (an RX 7800 XT on Adrenalin 26.10.1 played
+// hours on an oversized one). Since PR #56 such a pool stays imported, so on AMD the GPU reads the game's 2.4 GiB pool
+// over the PCIe: with the guarded draws rendering (OOT_GUARDED_LOOP) the GPU parts reading it took 100-150 ms each,
+// 1 fps. The import keeps its window buffers: copies between them and the mirror go through the window holding each
+// piece (copy_windowed), and a span resolved through a window keeps it when it lies outside the mirror (vk_mem_use).
+// Off by default: NVIDIA's maxBufferSize is above the pool, and an RX 9070 XT lost the device on an oversized buffer
+// (#56). Replay thread only.
+static int oot_mirror_oversize(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("OOT_MIRROR_OVERSIZE");
+        on = e && *e && *e != '0';
+        if (on) rt_log("mem: a pool larger than maxBufferSize gets a one-buffer mirror anyway (OOT_MIRROR_OVERSIZE)");
+    }
+    return on;
+}
+
+// LOCAL (AMD): OOT_MIRROR_OVERSIZE: the mirror of a windowed import is one buffer at mirror offsets, the import side of
+// each region is the window holding it (import_window), and a region that crosses a window end goes in pieces.
+// mregions hold mirror offsets on both sides when this is called; the guest offset is the mirror offset + mirror_lo.
+static void copy_windowed(VkCommandBuffer cb, PoolRec *r, int k, int to_mirror) {
+    for (int j = 0; j < k; j++) {
+        uint64_t mlo = mregions[j].srcOffset, mhi = mlo + mregions[j].size;
+        while (mlo < mhi) {
+            uint64_t g = mlo + r->mirror_lo, ws, we;
+            uint32_t w = import_window(r, g, &ws, &we);
+            uint64_t end = mhi;
+            if (g + (mhi - mlo) > we) end = mlo + (we - g);
+            VkBufferCopy c = to_mirror ? (VkBufferCopy){g - ws, mlo, end - mlo} : (VkBufferCopy){mlo, g - ws, end - mlo};
+            if (to_mirror) vkCmdCopyBuffer(cb, r->wbuf[w], r->mbuf, 1, &c);
+            else vkCmdCopyBuffer(cb, r->mbuf, r->wbuf[w], 1, &c);
+            mlo = end;
+        }
+    }
+}
+
 // Records the ranges as one vkCmdCopyBuffer per pool, overlapping and adjacent ranges merged; to_mirror: buf -> mbuf,
 // else mbuf -> buf. Returns the commands recorded; adds what they move to *bytes and *copies.
 static int copy_ranges(VkCommandBuffer cb, MRange *a, int n, int to_mirror, uint64_t *bytes, uint64_t *copies) {
@@ -1521,12 +1670,16 @@ static int copy_ranges(VkCommandBuffer cb, MRange *a, int n, int to_mirror, uint
             mregions[k++] = (VkBufferCopy){lo, lo, hi - lo};
         }
         if (!k) continue;
-        for (int j = 0; j < k; j++) {   // mregions hold the mirror offset; the guest side is shifted by mirror_lo
-            if (to_mirror) mregions[j].srcOffset += r->mirror_lo;
-            else mregions[j].dstOffset += r->mirror_lo;
+        if (r->nwin) {   // LOCAL (AMD): OOT_MIRROR_OVERSIZE: through the import's windows
+            copy_windowed(cb, r, k, to_mirror);
+        } else {
+            for (int j = 0; j < k; j++) {   // mregions hold the mirror offset; the guest side is shifted by mirror_lo
+                if (to_mirror) mregions[j].srcOffset += r->mirror_lo;
+                else mregions[j].dstOffset += r->mirror_lo;
+            }
+            if (to_mirror) vkCmdCopyBuffer(cb, r->buf, r->mbuf, (uint32_t)k, mregions);
+            else vkCmdCopyBuffer(cb, r->mbuf, r->buf, (uint32_t)k, mregions);
         }
-        if (to_mirror) vkCmdCopyBuffer(cb, r->buf, r->mbuf, (uint32_t)k, mregions);
-        else vkCmdCopyBuffer(cb, r->mbuf, r->buf, (uint32_t)k, mregions);
         rec++;
         for (int j = 0; j < k; j++) *bytes += mregions[j].size;
         *copies += (uint64_t)k;
@@ -1567,7 +1720,7 @@ static void mirror_create(PoolRec *r) {
         partial = !(e && *e == '0');
         if (partial) rt_log("mem: partial mirrors on: large pools mirror only the window the game uses");
     }
-    if (partial && full >= (256ull << 20)) {
+    if (partial && full >= (256ull << 20) && !lazy_on) {   // LOCAL (AMD): the lazy write-back works on full mirrors
         uint64_t lo = __atomic_load_n(&r->use_lo, __ATOMIC_RELAXED), hi = __atomic_load_n(&r->use_hi, __ATOMIC_RELAXED);
         if (hi > lo && hi <= full) {
             const uint64_t A = 1ull << 21;   // 2 MiB, the write-watch region
@@ -1578,12 +1731,13 @@ static void mirror_create(PoolRec *r) {
     }
     r->mirror_lo = wlo, r->mirror_hi = whi;
     r->mstate = MS_REFUSED;
-    if (r->nwin) return refuse(r, MR_OVERLAP, "it is a windowed import");
+    if (r->nwin && !oot_mirror_oversize()) return refuse(r, MR_OVERLAP, "it is a windowed import");   // LOCAL (AMD)
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     if (r->kind != POOL_IMPORT || !r->buf || !n) return;
     // A mirror past maxBufferSize would be an oversized buffer (VUID-VkBufferCreateInfo-size-06409), and a windowed
     // import's spans name window buffers, not offsets into one mirror. Such a pool stays imported.
-    if (c->max_buffer_size && n > c->max_buffer_size) return refuse(r, MR_ALLOC, "it is larger than the device's maxBufferSize");
+    if (c->max_buffer_size && n > c->max_buffer_size && !oot_mirror_oversize())   // LOCAL (AMD): OOT_MIRROR_OVERSIZE
+        return refuse(r, MR_ALLOC, "it is larger than the device's maxBufferSize");
     plat_mutex_lock_shared(&pool_lock);
     int i = pidx_upper(&pool_index, r->lo) - 1;
     while (i >= 0 && pool_index.e[i].buf != r) i--;
@@ -1640,7 +1794,35 @@ static void mirror_create(PoolRec *r) {
                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
                                   .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
-    VkResult res = vmaCreateBuffer(c->vma, &bi, &ai, &r->mbuf, &r->malloc_, NULL);
+    VkResult res = VK_ERROR_UNKNOWN;
+    r->mmap = NULL, r->lazy = 0;
+    static uint64_t lz_lo = 0, lz_hi = ~0ull;   // OOT_LAZY_RANGE=<lo>:<hi> (hex): only pools starting there (bisection)
+    static int lz_rinit;
+    if (!lz_rinit) {
+        lz_rinit = 1;
+        const char *e = getenv("OOT_LAZY_RANGE");
+        if (e && *e) { char *end; lz_lo = strtoull(e, &end, 16); if (*end == ':') lz_hi = strtoull(end + 1, NULL, 16); }
+    }
+    if (lazy_on && r->import_lo >= lz_lo && r->import_lo < lz_hi) {   // LOCAL (AMD): host-visible VRAM (ReBAR): the CPU reads GPU writes on demand
+        VmaAllocationCreateInfo ah = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+                                      .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+        VmaAllocationInfo info;
+        res = vmaCreateBuffer(c->vma, &bi, &ah, &r->mbuf, &r->malloc_, &info);
+        if (res == VK_SUCCESS && info.pMappedData) {
+            r->mmap = info.pMappedData, r->lazy = 1;
+            static volatile int32_t told;
+            if (plat_inc32(&told) <= 160) {
+                char f[160];
+                flag_names(r->flags, f, sizeof f);
+                rt_log("mem: lazy mirror %#llx+%#llx (%s)", (unsigned long long)r->import_lo,
+                       (unsigned long long)(r->import_hi - r->import_lo), f);
+            }
+        }
+        else if (res == VK_SUCCESS) vmaDestroyBuffer(c->vma, r->mbuf, r->malloc_), res = VK_ERROR_UNKNOWN;
+        if (res != VK_SUCCESS) r->mbuf = VK_NULL_HANDLE, r->malloc_ = NULL, plat_inc64(&lz_nohost);
+    }
+    if (res != VK_SUCCESS) res = vmaCreateBuffer(c->vma, &bi, &ai, &r->mbuf, &r->malloc_, NULL);
     if (res != VK_SUCCESS) {
         r->mbuf = VK_NULL_HANDLE, r->malloc_ = NULL;
         char why[96];
@@ -1657,6 +1839,7 @@ static void mirror_create(PoolRec *r) {
     plat_mutex_unlock(&pool_lock);
     r->acc_sub = msub;
     r->mstate = MS_ON;
+    pt_set_pool(r, 0);   // LOCAL (AMD): OOT_GLOOP_PAGES: its pages now read the mirror
     range_add(&pend, &npend, &cpend, r, 0, n);
     mrep.first_n++, mrep.first_bytes += n;
     plat_inc64(&m_live_n);
@@ -1664,6 +1847,7 @@ static void mirror_create(PoolRec *r) {
 }
 
 static void mirror_forget(PoolRec *r) {
+    lz_forget(r);   // LOCAL (AMD): its protected pages back to read-write before the storage returns to the guest
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     for (int i = 0; i < nm; i++)
         if (mlist[i] == r) {
@@ -1720,19 +1904,21 @@ static void mirror_sync(PoolRec *r) {
         if (!ch) continue;
         for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT)
             if (ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since)
-                range_add(&pend, &npend, &cpend, r, x - lo, 1ull << GEN_PAGE_SHIFT);
+                lz_upload_add(r, x - lo, 1ull << GEN_PAGE_SHIFT);   // LOCAL (AMD): range_add minus lazy pending bytes
     }
     r->mgen = gen_now;
     if (excl) plat_mutex_unlock(&gen_lock);
     else plat_mutex_unlock_shared(&gen_lock);
     if (__atomic_load_n(&r->fl_hi, __ATOMIC_ACQUIRE)) {
+        static int flush_up = -1;   // LOCAL (AMD): OOT_MIRROR_FLUSH_UPLOAD=0: a write-watched pool's flush range is not uploaded on top of its dirty pages
+        if (flush_up < 0) { const char *e = getenv("OOT_MIRROR_FLUSH_UPLOAD"); flush_up = !(e && *e == '0'); if (!flush_up) rt_log("mem: OOT_MIRROR_FLUSH_UPLOAD=0: flush ranges of tracked pools not uploaded (test)"); }
         plat_mutex_lock(&flush_lock);
         uint64_t a = r->fl_lo, b = r->fl_hi;
         r->fl_hi = 0;
         plat_mutex_unlock(&flush_lock);
         a = a > lo ? a & ~0xfffull : lo;
         b = b < hi ? (b + 0xfff) & ~0xfffull : hi;
-        if (a < b) range_add(&pend, &npend, &cpend, r, a - lo, b - a);
+        if (a < b && (flush_up || r->untracked)) lz_upload_add(r, a - lo, b - a);   // LOCAL (AMD): minus lazy pending bytes
     }
     mrep.syncs++;
     mrep.sync_t += qpc() - t0;
@@ -1748,12 +1934,12 @@ void vk_mem_use(VkMemSpan *sp) {
     if (r->mstate == MS_NONE) mirror_create(r);
     if (r->mstate != MS_ON) return;
     if (r->acc_sub != msub) mirror_sync(r);
-    if (r->nwin) return;   // windowed imports name window buffers, not offsets into a mirror
+    if (r->nwin && !oot_mirror_oversize()) return;   // windowed imports name window buffers, not offsets into a mirror
     if (span_in_mirror(r, sp)) {
         sp->buffer = r->mbuf;
         sp->offset = sp->guest_offset - r->mirror_lo;
         sp->avail = r->mirror_hi - sp->guest_offset;
-    } else {
+    } else if (!r->nwin) {   // LOCAL (AMD): a windowed import's span keeps the window the resolve gave it
         sp->buffer = r->buf;
         sp->offset = sp->guest_offset;
     }
@@ -1763,12 +1949,12 @@ void vk_mem_pick(VkMemSpan *sp) {
     PoolRec *r = sp->pool;
     if (!r || r->mstate != MS_ON) return;
     if (r->acc_sub != msub) mirror_sync(r);
-    if (r->nwin) return;
+    if (r->nwin && !oot_mirror_oversize()) return;   // LOCAL (AMD): OOT_MIRROR_OVERSIZE
     if (span_in_mirror(r, sp)) {
         sp->buffer = r->mbuf;
         sp->offset = sp->guest_offset - r->mirror_lo;
         sp->avail = r->mirror_hi - sp->guest_offset;
-    } else {
+    } else if (!r->nwin) {
         sp->buffer = r->buf;
         sp->offset = sp->guest_offset;
     }
@@ -1782,10 +1968,386 @@ int vk_mem_mirror_probe(uint64_t addr) {
     return ((PoolRec *)sp.pool)->mstate == MS_ON;
 }
 
+// LOCAL (AMD) test switch: OOT_MIRROR_NO_WB=1 skips the write-back of GPU writes into mirrors (the CPU then reads stale
+// guest memory): measures what the write-back copies cost, not for play.
+static int oot_mirror_no_wb(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("OOT_MIRROR_NO_WB"); v = e && *e == '1'; if (v) rt_log("mem: OOT_MIRROR_NO_WB=1: mirror write-back off (test)"); }
+    return v;
+}
+
+// ---------------------------------------------------------------- lazy write-back (LOCAL (AMD), OOT_MIRROR_LAZY_WB)
+// The eager write-back copies every GPU-written mirror range back to guest memory at the end of its submission: with
+// guarded bindings (bind_range marks WRITTEN_CAP bytes of each candidate written, whether the shader stored or not)
+// that is 100 MiB a frame on an RX 7800 XT, 4 ms of GPU in a settled scene and up to 20 ms while new pipelines come
+// in. Here a mirror is allocated in host-visible VRAM when the driver offers it (ReBAR); a GPU-written range of such a
+// pool is not copied back: its guest pages are made PAGE_NOACCESS (persistent: the GPU rewriting the range later costs
+// nothing), and the first CPU access faults (plat_mem_access_hook): the handler waits for the writing submission,
+// copies the pending bytes of that page from the mapping, makes the page read-write again and adds it to the pool's
+// eager set, so later GPU writes into that page go back the eager way, byte-precise, with no further fault. Pages the
+// CPU never touches are never copied. A fault on a page whose writing submission is not issued yet (the replay thread
+// reading guest memory while recording) copies nothing: the guest bytes are the pre-write ones it should see; the page
+// is unprotected for now and protected again at the next submission's start. lazy_lock is a leaf lock: the handler takes
+// it on any thread; nothing under it touches guest memory except the copy into a page just made writable.
+static int lazy_on;                             // OOT_MIRROR_LAZY_WB
+static PlatMutex lazy_lock = PLAT_MUTEX_INIT;
+static PoolRec **lzpools;                       // lazy_lock: lazy pools that have or had pending ranges, by import_lo
+static int nlzpools, clzpools;
+static struct { PoolRec *r; uint64_t off, size; } *lz_new;   // replay: lazy ranges of the submission being recorded
+static int nlz_new, clz_new;
+static struct { PoolRec *r; uint64_t page; } *lz_reprot;     // lazy_lock: pages to protect again at the next begin
+static int nlz_reprot, clz_reprot;
+static volatile int64_t lz_faults, lz_faults_wr, lz_unissued, lz_copied, lz_prot_pages, lz_foreign, lz_prot_fail, lz_waits, lz_thawed;
+
+static void lz_pool_track(PoolRec *r) {   // lazy_lock held
+    for (int i = 0; i < nlzpools; i++) if (lzpools[i] == r) return;
+    if (nlzpools == clzpools) grow((void **)&lzpools, &clzpools, sizeof *lzpools);
+    int at = nlzpools;
+    while (at > 0 && lzpools[at - 1]->import_lo > r->import_lo) at--;
+    memmove(lzpools + at + 1, lzpools + at, (size_t)(nlzpools - at) * sizeof *lzpools);
+    lzpools[at] = r;
+    nlzpools++;
+}
+
+static PoolRec *lz_pool_of(uint64_t a) {   // lazy_lock held: the tracked pool whose import range holds a
+    int lo = 0, hi = nlzpools;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (lzpools[mid]->import_lo <= a) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo == 0) return NULL;
+    PoolRec *r = lzpools[lo - 1];
+    return a < r->import_hi ? r : NULL;
+}
+
+// LOCAL (AMD): the newest fence of the on-demand write-back's pending ranges over [addr, addr + size): a CPU read that
+// waits for it first (vk_backend.c guest_read) then faults the page in with the GPU's bytes, not the old ones.
+static uint64_t lz_written_fence(uint64_t addr, uint64_t size) {
+    if (!lazy_on || !size) return 0;
+    uint64_t f = 0;
+    plat_mutex_lock(&lazy_lock);
+    PoolRec *r = lz_pool_of(addr);
+    if (r) {
+        uint64_t lo = addr - r->import_lo, hi = lo + size;
+        for (int i = 0; i < r->nlz; i++)
+            if (r->lz[i].off < hi && r->lz[i].off + r->lz[i].size > lo && r->lz[i].fence > f) f = r->lz[i].fence;
+    }
+    plat_mutex_unlock(&lazy_lock);
+    return f;
+}
+
+// Inserts [off, off + size) with its fence into a sorted list, merging overlaps and adjacency (the newest fence wins).
+static void lz_insert(LzRange **l, int *n, int *cap, uint64_t off, uint64_t size, uint64_t fence) {
+    LzRange *a = *l;
+    int i = 0;
+    while (i < *n && a[i].off + a[i].size < off) i++;
+    int j = i;
+    uint64_t lo = off, hi = off + size;
+    while (j < *n && a[j].off <= hi) {
+        if (a[j].off < lo) lo = a[j].off;
+        if (a[j].off + a[j].size > hi) hi = a[j].off + a[j].size;
+        if (a[j].fence > fence) fence = a[j].fence;
+        j++;
+    }
+    int keep = j - i;   // entries replaced by the merged one
+    if (keep == 0) {
+        if (*n == *cap) grow((void **)l, cap, sizeof **l), a = *l;
+        memmove(a + i + 1, a + i, (size_t)(*n - i) * sizeof *a);
+        (*n)++;
+    } else if (keep > 1) {
+        memmove(a + i + 1, a + j, (size_t)(*n - j) * sizeof *a);
+        *n -= keep - 1;
+    }
+    a[i] = (LzRange){lo, hi - lo, fence};
+}
+
+// Cuts [off, off + size) out of a sorted list.
+static void lz_cut(LzRange **l, int *n, int *cap, uint64_t off, uint64_t size) {
+    LzRange *a = *l;
+    uint64_t lo = off, hi = off + size;
+    for (int i = 0; i < *n;) {
+        uint64_t a0 = a[i].off, a1 = a0 + a[i].size;
+        if (a1 <= lo || a0 >= hi) { i++; continue; }
+        if (a0 < lo && a1 > hi) {   // a hole in the middle: split
+            if (*n == *cap) grow((void **)l, cap, sizeof **l), a = *l;
+            memmove(a + i + 1, a + i, (size_t)(*n - i) * sizeof *a);
+            (*n)++;
+            a[i].size = lo - a0;
+            a[i + 1] = (LzRange){hi, a1 - hi, a[i + 1].fence};
+            return;
+        }
+        if (a0 < lo) { a[i].size = lo - a0; i++; continue; }
+        if (a1 > hi) { a[i].size = a1 - hi, a[i].off = hi; i++; continue; }
+        memmove(a + i, a + i + 1, (size_t)(*n - i - 1) * sizeof *a);
+        (*n)--;
+    }
+}
+
+static int lz_page_bit(const PoolRec *r, uint64_t page) {   // page: offset from import_lo
+    return r->pbits && (r->pbits[page >> 15] >> ((page >> 12) & 7) & 1);
+}
+static void lz_page_set(PoolRec *r, uint64_t page, int v) {
+    if (!r->pbits) r->pbits = calloc(((r->import_hi - r->import_lo) >> 15) + 1, 1);
+    if (!r->pbits) return;
+    if (v) r->pbits[page >> 15] |= (uint8_t)(1u << ((page >> 12) & 7));
+    else r->pbits[page >> 15] &= (uint8_t)~(1u << ((page >> 12) & 7));
+}
+
+// lazy_lock held: protects the pages of [off, off + size) not protected yet, in runs.
+static void lz_protect(PoolRec *r, uint64_t off, uint64_t size) {
+    uint64_t lim = r->import_hi - r->import_lo, p0 = off & ~0xfffull, p1 = (off + size + 0xfff) & ~0xfffull;
+    if (p1 > lim) p1 = lim;
+    for (uint64_t p = p0; p < p1;) {
+        if (lz_page_bit(r, p)) { p += 0x1000; continue; }
+        uint64_t q = p;
+        while (q < p1 && !lz_page_bit(r, q)) lz_page_set(r, q, 1), q += 0x1000;
+        if (!plat_mem_protect(r->import_lo + p, q - p, PLAT_PROT_NONE)) {
+            for (uint64_t x = p; x < q; x += 0x1000) lz_page_set(r, x, 0);   // left readable: eager copies would be needed; rare
+            plat_inc64(&lz_prot_fail);
+        }
+        else plat_add64(&lz_prot_pages, (int64_t)((q - p) >> 12));
+        p = q;
+    }
+}
+
+// lazy_lock held: every protected page of the pool back to read-write (the pool goes away or stops being lazy).
+static void lz_unprotect_all(PoolRec *r) {
+    if (!r->pbits) return;
+    uint64_t lim = r->import_hi - r->import_lo;
+    for (uint64_t p = 0; p < lim;) {
+        if (!lz_page_bit(r, p)) { p += 0x1000; continue; }
+        uint64_t q = p;
+        while (q < lim && lz_page_bit(r, q)) lz_page_set(r, q, 0), q += 0x1000;
+        plat_mem_protect(r->import_lo + p, q - p, PLAT_PROT_RW);
+        plat_add64(&lz_prot_pages, -(int64_t)((q - p) >> 12));
+        p = q;
+    }
+}
+
+static void lz_forget(PoolRec *r) {   // pool_lock held (vk_pool_fini); the storage goes back to the guest
+    if (!lazy_on || !r->lazy) return;
+    plat_mutex_lock(&lazy_lock);
+    lz_unprotect_all(r);
+    for (int i = 0; i < nlzpools; i++)
+        if (lzpools[i] == r) { memmove(lzpools + i, lzpools + i + 1, (size_t)(nlzpools - i - 1) * sizeof *lzpools); nlzpools--; break; }
+    for (int i = 0; i < nlz_reprot;)
+        if (lz_reprot[i].r == r) lz_reprot[i] = lz_reprot[--nlz_reprot];
+        else i++;
+    for (int i = 0; i < nlz_new;)
+        if (lz_new[i].r == r) lz_new[i] = lz_new[--nlz_new];
+        else i++;
+    free(r->lz), free(r->eg), free(r->pbits);
+    r->lz = r->eg = NULL, r->pbits = NULL, r->nlz = r->clz = r->neg = r->ceg = 0, r->lazy = 0;
+    plat_mutex_unlock(&lazy_lock);
+}
+
+// The access hook: a fault on a protected page of a lazy pool. Returns 1 to retry the access.
+static int lz_fault(uint64_t a, int write) {
+    if (!lazy_on) return 0;
+    plat_mutex_lock(&lazy_lock);
+    PoolRec *r = lz_pool_of(a);
+    uint64_t page = (a & ~0xfffull) - (r ? r->import_lo : 0);
+    if (!r || !lz_page_bit(r, page)) { plat_mutex_unlock(&lazy_lock); plat_inc64(&lz_foreign); return 0; }
+    plat_inc64(&lz_faults);
+    if (write) plat_inc64(&lz_faults_wr);
+    VkCtx *vc = vk_ctx();
+    for (;;) {   // the newest fence among the page's pending ranges; wait for it with the lock free
+        uint64_t fence = 0, reached = 0;
+        for (int i = 0; i < r->nlz; i++)
+            if (r->lz[i].off < page + 0x1000 && r->lz[i].off + r->lz[i].size > page && r->lz[i].fence > fence) fence = r->lz[i].fence;
+        if (!fence || fence <= vk_sync_fence_done()) break;
+        // the GPU timeline itself: vk_sync's done moves after the completion thread's callbacks, which may fault here
+        if (vkGetSemaphoreCounterValue(vc->device, vc->timeline, &reached) == VK_SUCCESS && reached >= fence) break;
+        if (fence > vk_sync_issued()) {   // not submitted yet: the CPU sees the pre-write bytes, rightly; protect again later
+            plat_inc64(&lz_unissued);
+            lz_page_set(r, page, 0);
+            plat_mem_protect(r->import_lo + page, 0x1000, PLAT_PROT_RW);
+            plat_add64(&lz_prot_pages, -1);
+            if (nlz_reprot == clz_reprot) grow((void **)&lz_reprot, &clz_reprot, sizeof *lz_reprot);
+            lz_reprot[nlz_reprot].r = r, lz_reprot[nlz_reprot].page = page, nlz_reprot++;
+            uint64_t ga = r->import_lo + page;
+            plat_mutex_unlock(&lazy_lock);
+            mem_thaw(ga, 0x1000);
+            return 1;
+        }
+        plat_mutex_unlock(&lazy_lock);
+        VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                                  .pSemaphores = &vc->timeline, .pValues = &fence};
+        if (vkWaitSemaphores(vc->device, &wi, 10000000000ull) != VK_SUCCESS) vk_sync_fence_wait(fence, ~0ull);
+        plat_inc64(&lz_waits);
+        plat_mutex_lock(&lazy_lock);
+        r = lz_pool_of(a);
+        if (!r || !lz_page_bit(r, page)) { plat_mutex_unlock(&lazy_lock); return 1; }   // done by another thread meanwhile
+    }
+    // the page readable first: the copy below writes it
+    lz_page_set(r, page, 0);
+    plat_mem_protect(r->import_lo + page, 0x1000, PLAT_PROT_RW);
+    plat_add64(&lz_prot_pages, -1);
+    VkCtx *c = vk_ctx();
+    for (int i = 0; i < r->nlz; i++) {
+        uint64_t lo = r->lz[i].off, hi = lo + r->lz[i].size;
+        if (lo < page) lo = page;
+        if (hi > page + 0x1000) hi = page + 0x1000;
+        if (lo >= hi) continue;
+        vmaInvalidateAllocation(c->vma, r->malloc_, lo, hi - lo);
+        memcpy((void *)(uintptr_t)(r->import_lo + lo), r->mmap + lo, (size_t)(hi - lo));
+        plat_add64(&lz_copied, (int64_t)(hi - lo));
+    }
+    lz_cut(&r->lz, &r->nlz, &r->clz, page, 0x1000);
+    lz_insert(&r->eg, &r->neg, &r->ceg, page, 0x1000, 0);   // from now on this page goes back the eager way
+    uint64_t ga = r->import_lo + page;
+    plat_mutex_unlock(&lazy_lock);
+    mem_thaw(ga, 0x1000);   // the freeze bookkeeping: the page is writable again
+    return 1;
+}
+
+// mem_thaw's hook (file reads into guest buffers, mapping changes): the pending pages in [a, a+n) are resolved as a
+// CPU access would (wait, copy, read-write, eager), since a kernel write into a no-access page fails instead of
+// faulting. lz_fault calls mem_thaw itself: the depth guard stops the recursion.
+static void lz_thaw(uint64_t a, uint64_t n) {
+    static _Thread_local int depth;
+    if (!lazy_on || !n || depth) return;
+    depth++;
+    uint64_t lo = a & ~0xfffull, hi = (a + n + 0xfff) & ~0xfffull;
+    for (uint64_t p = lo; p < hi; p += 0x1000) {
+        plat_mutex_lock(&lazy_lock);
+        PoolRec *r = lz_pool_of(p);
+        int prot = r && lz_page_bit(r, p - r->import_lo);
+        if (r && !prot) {   // skip to the next protected page of this pool, or its end
+            uint64_t lim = r->import_hi;
+            uint64_t q = p + 0x1000;
+            while (q < hi && q < lim && !lz_page_bit(r, q - r->import_lo)) q += 0x1000;
+            plat_mutex_unlock(&lazy_lock);
+            p = q - 0x1000;
+            continue;
+        }
+        plat_mutex_unlock(&lazy_lock);
+        if (prot && lz_fault(p, 1)) plat_inc64(&lz_thawed);
+    }
+    depth--;
+}
+
+// Replay: an upload of [off, off + size) into the pool's mirror, minus its pending GPU-written bytes (guest memory is
+// stale there; the mirror holds the newer bytes). Plain range_add for other pools.
+static void lz_upload_add(PoolRec *r, uint64_t off, uint64_t size) {
+    if (!lazy_on || !r->lazy) { range_add(&pend, &npend, &cpend, r, off, size); return; }
+    plat_mutex_lock(&lazy_lock);
+    uint64_t at = off, end = off + size;
+    for (int i = 0; i < r->nlz && at < end; i++) {
+        uint64_t p0 = r->lz[i].off, p1 = p0 + r->lz[i].size;
+        if (p1 <= at) continue;
+        if (p0 >= end) break;
+        if (p0 > at) range_add(&pend, &npend, &cpend, r, at, p0 - at);
+        at = p1;
+    }
+    if (at < end) range_add(&pend, &npend, &cpend, r, at, end - at);
+    plat_mutex_unlock(&lazy_lock);
+}
+
+// Replay: a GPU write into a lazy pool. The part inside the eager set is written back at the end of the submission
+// as before; the rest waits for a CPU access.
+static void lz_gpu_wrote(PoolRec *r, uint64_t off, uint64_t size) {
+    uint64_t lim = r->import_hi - r->import_lo;
+    if (off >= lim) return;
+    if (size > lim - off) size = lim - off;
+    plat_mutex_lock(&lazy_lock);
+    uint64_t at = off, end = off + size;
+    for (int i = 0; i < r->neg && at < end; i++) {
+        uint64_t e0 = r->eg[i].off, e1 = e0 + r->eg[i].size;
+        if (e1 <= at) continue;
+        if (e0 >= end) break;
+        if (e0 > at) {   // a lazy gap before this eager range
+            if (nlz_new == clz_new) grow((void **)&lz_new, &clz_new, sizeof *lz_new);
+            lz_new[nlz_new].r = r, lz_new[nlz_new].off = at, lz_new[nlz_new].size = e0 - at, nlz_new++;
+            at = e0;
+        }
+        uint64_t x1 = e1 < end ? e1 : end;
+        range_add(&wbl, &nwbl, &cwbl, r, at, x1 - at);
+        at = x1;
+    }
+    if (at < end) {
+        if (nlz_new == clz_new) grow((void **)&lz_new, &clz_new, sizeof *lz_new);
+        lz_new[nlz_new].r = r, lz_new[nlz_new].off = at, lz_new[nlz_new].size = end - at, nlz_new++;
+    }
+    plat_mutex_unlock(&lazy_lock);
+}
+
+// Replay, at the end of the submission: its lazy ranges become pending with its fence, their pages protected; the
+// GPU's writes made visible to the host.
+static int lz_submission_end(VkCommandBuffer cb, uint64_t fence) {
+    if (!nlz_new) return 0;
+    mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
+             VK_ACCESS_2_HOST_READ_BIT);
+    plat_mutex_lock(&lazy_lock);
+    for (int i = 0; i < nlz_new; i++) {
+        PoolRec *r = lz_new[i].r;
+        if (!r->lazy) continue;
+        lz_insert(&r->lz, &r->nlz, &r->clz, lz_new[i].off, lz_new[i].size, fence);
+        lz_protect(r, lz_new[i].off, lz_new[i].size);
+        lz_pool_track(r);
+    }
+    plat_mutex_unlock(&lazy_lock);
+    nlz_new = 0;
+    return 1;
+}
+
+// Replay, at the start of a submission: pages unprotected by a fault on a not-yet-issued submission get protected again
+// (that submission is issued by now) while they still hold pending ranges.
+static void lz_submission_begin(void) {
+    if (!nlz_reprot) return;
+    plat_mutex_lock(&lazy_lock);
+    for (int i = 0; i < nlz_reprot; i++) {
+        PoolRec *r = lz_reprot[i].r;
+        uint64_t page = lz_reprot[i].page;
+        int pending = 0;
+        for (int k = 0; k < r->nlz && !pending; k++)
+            pending = r->lz[k].off < page + 0x1000 && r->lz[k].off + r->lz[k].size > page;
+        if (pending && r->lazy) lz_protect(r, page, 0x1000);
+    }
+    nlz_reprot = 0;
+    plat_mutex_unlock(&lazy_lock);
+}
+
+static void lz_log(void) {
+    if (!lazy_on) return;
+    plat_mutex_lock(&lazy_lock);
+    double pend = 0, eager = 0;
+    int pools = 0;
+    for (int i = 0; i < nlzpools; i++) {
+        PoolRec *r = lzpools[i];
+        if (r->nlz) pools++;
+        for (int k = 0; k < r->nlz; k++) pend += (double)r->lz[k].size;
+        for (int k = 0; k < r->neg; k++) eager += (double)r->eg[k].size;
+    }
+    plat_mutex_unlock(&lazy_lock);
+    rt_log("mem: lazy write-back: %d pools with pending ranges (%d tracked), pending %.1f MiB, protected %lld pages, eager set %.1f MiB; "
+           "faults %lld (writes %lld, before issue %lld), copied on demand %.2f MiB, mirrors without host mapping %lld, foreign faults %lld, protect failures %lld, GPU waits %lld, pages resolved by mem_thaw %lld",
+           pools, nlzpools, pend / 1048576.0, (long long)__atomic_load_n(&lz_prot_pages, __ATOMIC_RELAXED), eager / 1048576.0,
+           (long long)plat_xchg64(&lz_faults, 0), (long long)plat_xchg64(&lz_faults_wr, 0), (long long)plat_xchg64(&lz_unissued, 0),
+           plat_xchg64(&lz_copied, 0) / 1048576.0, (long long)__atomic_load_n(&lz_nohost, __ATOMIC_RELAXED),
+           (long long)plat_xchg64(&lz_foreign, 0), (long long)__atomic_load_n(&lz_prot_fail, __ATOMIC_RELAXED),
+           (long long)plat_xchg64(&lz_waits, 0), (long long)plat_xchg64(&lz_thawed, 0));
+}
+
+// LOCAL (AMD): OOT_MIRROR_WB_NOACC=0: no write-back for CPU_NO_ACCESS pools (the CPU cannot read them); 1 (default)
+// as before. The bytes asked per class go in the mirror frame line.
+static int oot_wb_noacc(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("OOT_MIRROR_WB_NOACC"); v = !(e && *e == '0'); }
+    return v;
+}
+static volatile int64_t oot_wb_cls[3];   // bytes of GPU writes asked back: CPU_NO_ACCESS, CPU_UNCACHED, CPU_CACHED pools
+
 void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) {
     PoolRec *r = sp->pool;
     if (!r || !size) return;
     if (r->mstate == MS_ON && sp->buffer == r->mbuf) {
+        if (oot_mirror_no_wb()) return;   // LOCAL (AMD): test switch
+        int cls = r->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS ? 0 : r->flags & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED ? 1 : 2;
+        plat_add64(&oot_wb_cls[cls], (int64_t)size);
+        if (cls == 0 && !oot_wb_noacc()) return;
+        if (lazy_on && r->lazy && r->mmap) { lz_gpu_wrote(r, sp->offset, size); return; }   // LOCAL (AMD): on demand
         range_add(&wbl, &nwbl, &cwbl, r, sp->offset, size);   // written back at vk_mem_mirror_end
         return;
     }
@@ -1841,6 +2403,7 @@ void vk_mem_mirror_begin(void) {
         return;
     }
     uint64_t t0 = qpc();
+    if (lazy_on) lz_submission_begin();   // LOCAL (AMD)
     uint32_t prev = msub;
     msub = msub + 1 ? msub + 1 : 1;
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
@@ -1997,6 +2560,7 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
                  VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
         nwbl = 0;
     }
+    if (lazy_on) rec += lz_submission_end(cb, fence);   // LOCAL (AMD)
     if (mirror_verify) rec += verify_record(cb, fence);
     plat_mutex_lock(&mirror_stat_lock);
     uint64_t *d = (uint64_t *)&macc, *s = (uint64_t *)&mrep;
@@ -2038,6 +2602,10 @@ static void mirror_log(uint64_t frame) {
         snprintf(ver, sizeof ver, "; verify: pages compared %lld, skipped %lld (written since), mismatches %lld",
                  (long long)plat_xchg64(&v_pages, 0), (long long)plat_xchg64(&v_skipped, 0),
                  (long long)plat_xchg64(&v_mismatch, 0));
+    lz_log();   // LOCAL (AMD)
+    rt_log("mem: write-back asked per frame: CPU_NO_ACCESS %.1f MiB, CPU_UNCACHED %.1f, CPU_CACHED %.1f (OOT_MIRROR_WB_NOACC=%d)",
+           plat_xchg64(&oot_wb_cls[0], 0) / f / M, plat_xchg64(&oot_wb_cls[1], 0) / f / M, plat_xchg64(&oot_wb_cls[2], 0) / f / M,
+           oot_wb_noacc());   // LOCAL (AMD)
     rt_log("mem: mirror frame %llu: pools %lld, %.1f MiB device-local; stay imported: budget %lld (%.1f MiB), untracked "
            "%lld, overlapping %lld, failed %lld; per frame: submits %.2f, syncs %.1f, upload %.3f MiB in %.1f ranges, "
            "first use %.2f pools %.3f MiB, write-back %.3f MiB in %.1f ranges, flush calls %.1f (%.3f MiB), queries "

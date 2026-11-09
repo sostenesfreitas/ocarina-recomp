@@ -216,6 +216,53 @@ static void summary(void) {
     U.subs = U.off_subs = U.regions = U.bytes = U.copy_ns = U.hits = U.drops = U.inflight = U.refused = 0;
 }
 
+// LOCAL (AMD): a range the CPU cannot read right now (pages unmapped or protected meanwhile) is bound live instead of
+// copied: the copy faulted in memcpy on the replay thread (RX 7800 XT, crashes in ucrtbase). One kernel call for every
+// page of the submission (plat_mem_pages_readable): VirtualQuery per range cost ~0.5 ms a call inside the game's 2.4 GiB
+// pool, 1800 calls a frame, 1 fps. Not known (another platform): every range is kept, as upstream does.
+// OOT_USNAP_CHECK=0 turns the check off. Replay thread only.
+static int oot_drop_unreadable(Reg *reg, int nreg) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("OOT_USNAP_CHECK"); on = !(e && *e == '0'); }
+    if (!on) return nreg;
+    static uint64_t *pages;
+    static uint8_t *ok;
+    static int cap;
+    int np = 0;
+    for (int i = 0; i < nreg; i++) np += (int)(((reg[i].hi + 0xfff) >> 12) - (reg[i].lo >> 12));
+    if (np > cap) {
+        int c = cap ? cap : 1024;
+        while (c < np) c *= 2;
+        uint64_t *p2 = realloc(pages, (size_t)c * sizeof *pages);
+        uint8_t *o2 = realloc(ok, (size_t)c);
+        if (p2) pages = p2;
+        if (o2) ok = o2;
+        if (!p2 || !o2) return nreg;
+        cap = c;
+    }
+    int k = 0;
+    for (int i = 0; i < nreg; i++)
+        for (uint64_t p = reg[i].lo >> 12, e = (reg[i].hi + 0xfff) >> 12; p < e; p++) pages[k++] = p << 12;
+    if (!plat_mem_pages_readable(pages, np, ok)) return nreg;
+    int out = 0;
+    k = 0;
+    for (int i = 0; i < nreg; i++) {
+        int n = (int)(((reg[i].hi + 0xfff) >> 12) - (reg[i].lo >> 12)), good = 1;
+        for (int j = 0; j < n; j++) good &= ok[k + j];
+        k += n;
+        if (good) {
+            reg[out++] = reg[i];
+        } else {
+            U.refused++;
+            static volatile int32_t told;
+            if (plat_inc32(&told) <= 8)
+                rt_log("vk_usnap: %#llx+%#llx is not readable: bound live", (unsigned long long)reg[i].lo,
+                       (unsigned long long)(reg[i].hi - reg[i].lo));
+        }
+    }
+    return out;
+}
+
 void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     if (!U.mode) U.mode = rt_knob("UBO_SNAPSHOT", "1") + 1;   // stored +1: 0 is "not read yet"
     U.on = 0, U.fence = fence, U.gen++;
@@ -251,6 +298,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
         U.reg[U.nreg++] = (Reg){lo, hi, total, 0};
         total += (hi - lo + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
     }
+    if (U.nreg) U.nreg = oot_drop_unreadable(U.reg, U.nreg);   // LOCAL (AMD)
     if (!U.nreg) return;
     if (!(U.arena = arena_get(total))) return;
     for (int i = 0; i < U.nreg; i++)

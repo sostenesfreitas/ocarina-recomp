@@ -918,6 +918,45 @@ static void maybe_split(VkExec *ex) {
 
 // An ordered read of the GPU-visible backing at this replay position. In particular, imported guest bytes can be
 // older than their shadow or VRAM mirror. Read through the same resolver/pick path as a buffer copy, never the VA.
+// LOCAL (AMD, debug): `size` bytes of a device buffer at the replay position (ordered after every earlier command), as
+// vk_exec_read_buffer does for a guest address. OOT_MESH_RING (vk_exec_draw.c) reads the mesh ring with it.
+int vk_exec_read_vkbuf(VkExec *ex, VkBuffer src, VkDeviceSize src_off, uint64_t size, void *out) {
+    if (!x_here || ex != &X || !ex->cb || !src || !size) return 0;
+    VkCtx *c = vk_ctx();
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation allocation = NULL;
+    VmaAllocationInfo mapped = {0};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+    if (vmaCreateBuffer(c->vma, &bi, &ai, &buffer, &allocation, &mapped) != VK_SUCCESS) return 0;
+    if (!mapped.pMappedData) { vmaDestroyBuffer(c->vma, buffer, allocation); return 0; }
+    vk_exec_barrier(ex);
+    VkBufferCopy copy = {.srcOffset = src_off, .dstOffset = 0, .size = size};
+    vkCmdCopyBuffer(ex->cb, src, buffer, 1, &copy);
+    VkBufferMemoryBarrier2 host = {.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = buffer, .offset = 0, .size = size};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &host};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    ex->recorded += 2;
+    ex->cb = vk_sync_split_wait();
+    split_draws = 0;
+    part_start = ex->recorded;
+    part_t0 = kern_now_ns();
+    ex->barrier_at = -1;
+    ex->dirty = VK_EXEC_DIRTY_ALL;
+    vk_exec_draw_new_cb();
+    n_parts++;
+    VkResult result = vmaInvalidateAllocation(c->vma, allocation, 0, size);
+    if (result == VK_SUCCESS) memcpy(out, mapped.pMappedData, (size_t)size);
+    vmaDestroyBuffer(c->vma, buffer, allocation);
+    return result == VK_SUCCESS;
+}
+
 int vk_exec_read_buffer(VkExec *ex, uint64_t addr, uint64_t size, void *out) {
     if (!x_here || ex != &X || !ex->cb || !out || !addr || !size || size > (8ull << 20) ||
         addr > UINT64_MAX - size || (addr & 3) || (size & 3)) return 0;
@@ -964,11 +1003,38 @@ int vk_exec_read_buffer(VkExec *ex, uint64_t addr, uint64_t size, void *out) {
     return result == VK_SUCCESS;
 }
 
+// LOCAL (AMD, measurement): OOT_REPLAY_PROF=1: CPU ns of the replay per op kind and per phase of record_impl.
+static struct { int64_t ns[OP_COUNT_]; uint64_t n[OP_COUNT_]; int64_t pre, walk, post, subs; } RP;
+static int rp_on = -1;
+extern int oot_rp_on;
+extern int64_t oot_rp_draw[8];
+extern uint64_t oot_rp_draws;
+static void rp_report(void) {
+    if (!RP.subs) return;
+    double k = 1e-6 / (double)RP.subs;
+    if (oot_rp_draws) {
+        static const char *ph[7] = {"shaders", "pipeline", "bind+dynstate", "dyn_collect", "bind_resources", "tail(fb,vb,oq)", "index+vkCmdDraw"};
+        for (int i = 0; i < 7; i++)
+            rt_log("replay prof:   draw phase %-16s %.3f ms per submission, %.2f us per draw", ph[i], oot_rp_draw[i] * k, oot_rp_draw[i] / 1e3 / (double)oot_rp_draws);
+        rt_log("replay prof:   (%.1f prepared draws per submission)", (double)oot_rp_draws / (double)RP.subs);
+        memset(oot_rp_draw, 0, sizeof oot_rp_draw), oot_rp_draws = 0;
+    }
+    rt_log("replay prof: per submission: pre %.3f ms, walk %.3f ms, post %.3f ms (%lld submissions)", RP.pre * k, RP.walk * k, RP.post * k, (long long)RP.subs);
+    for (int r = 0; r < 14; r++) {
+        int best = -1;
+        for (int i = 0; i < OP_COUNT_; i++) if (RP.n[i] && (best < 0 || RP.ns[i] > RP.ns[best])) best = i;
+        if (best < 0 || RP.ns[best] * k < 0.005) break;
+        rt_log("replay prof:   %-18s %.3f ms, %.1f calls, %.2f us each", nvn_op_name(best), RP.ns[best] * k, (double)RP.n[best] / (double)RP.subs, RP.ns[best] / 1e3 / (double)RP.n[best]);
+        RP.ns[best] = 0, RP.n[best] = 0;
+    }
+    memset(&RP, 0, sizeof RP);
+}
 static void walk(VkExec *ex, const op_hdr *h, int depth) {
     for (;;) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
         const void *a = nvn_op_payload(h);
+        int64_t rp_t0 = rp_on > 0 ? (int64_t)kern_now_ns() : 0;   // LOCAL (AMD): OOT_REPLAY_PROF
         switch (h->op) {
         case OP_END: return;
         case OP_BEGIN: break;
@@ -1046,6 +1112,7 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
             break;
         default: rt_fatal("vk: op %s has no replay handler", nvn_op_name(h->op));
         }
+        if (rp_on > 0) RP.ns[h->op] += (int64_t)kern_now_ns() - rp_t0, RP.n[h->op]++;   // LOCAL (AMD): OOT_REPLAY_PROF
         if (split_draws >= split_n) maybe_split(ex);
         h = nvn_op_next(h);
     }
@@ -1071,7 +1138,10 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
     part_t0 = kern_now_ns();
     x_here = 1;
     int memory = n || work;
+    if (rp_on < 0) { const char *e = getenv("OOT_REPLAY_PROF"); rp_on = e && *e == '1'; oot_rp_on = rp_on; }   // LOCAL (AMD)
+    int64_t rp_a = rp_on > 0 ? (int64_t)kern_now_ns() : 0;
     if (memory) vk_mem_mirror_begin(), vk_usnap_begin(handles, n, fence);
+    int64_t rp_b = rp_on > 0 ? (int64_t)kern_now_ns() : 0;
     if (work) work(ex, context);
     else {
         for (int i = 0; i < n; i++) {
@@ -1079,10 +1149,16 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
             walk(ex, nvn_op_first(handles[i]), 0);
         }
     }
+    int64_t rp_c = rp_on > 0 ? (int64_t)kern_now_ns() : 0;
     vk_exec_pass_end(ex);
     x_here = 0;
     if (ex->recorded) vk_exec_barrier(ex);   // later submissions see this one's writes
     if (memory) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
+    if (rp_on > 0 && memory) {   // LOCAL (AMD): OOT_REPLAY_PROF
+        int64_t rp_d = (int64_t)kern_now_ns();
+        RP.pre += rp_b - rp_a, RP.walk += rp_c - rp_b, RP.post += rp_d - rp_c, RP.subs++;
+        if (RP.subs >= 240) rp_report();
+    }
     if (ex->nviews) {
         ViewList *l = malloc(sizeof *l + sizeof(VkImageView) * (size_t)ex->nviews);
         if (!l) rt_fatal("vk: out of memory");

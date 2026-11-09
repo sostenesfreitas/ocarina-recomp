@@ -198,6 +198,9 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 // A write that faulted on a read-only page at addr goes to fn first; fn returns 1 when it made the page writable and
 // the write should run again, 0 to let the fault go on (to the crash handler). One hook per process.
 void plat_mem_fault_hook(int (*fn)(uint64_t addr));
+// LOCAL (AMD): a hook for every access violation, read (write 0) or write (1), before the write-fault hook; 1 retries
+// the access (vk_memory.c: on-demand mirror write-back).
+void plat_mem_access_hook(int (*fn)(uint64_t addr, int write));
 // Starts this program again with the same arguments and ends this process with the new one's exit code (Windows), or
 // replaces this process with it (Linux). Environment changes made before the call are passed on.
 _Noreturn void plat_reexec(void);
@@ -221,6 +224,9 @@ void plat_crash_note(const char *note);   // this thread's current work, named b
 void plat_crash_file(const char *path);   // a crash with a note appends the note as a line to this file
 int plat_mem_read(uint64_t addr, void *out, size_t n);    // copies n bytes, 0 instead of faulting on unmapped memory
 int plat_mem_readable(uint64_t addr, uint64_t n);         // every page of [addr, addr + n) can be read; no fault
+// LOCAL (AMD): ok[i] = 1 when the page at pages[i] is mapped in and readable right now, in one kernel call for all of
+// them (Windows: QueryWorkingSetEx). A committed page that is not resident counts as not readable. 0: not known here.
+int plat_mem_pages_readable(const uint64_t *pages, int n, uint8_t *ok);
 void *plat_aligned_alloc(size_t size, size_t align);      // free with plat_aligned_free; NULL on failure
 void plat_aligned_free(void *p);
 

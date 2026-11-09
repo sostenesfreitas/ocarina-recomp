@@ -548,18 +548,32 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 }
 
 static int (*fault_hook)(uint64_t addr);
+static int (*access_hook)(uint64_t addr, int write);   // LOCAL (AMD): read and write faults, first
+static int fault_veh_on;
 
 // A write access violation (ExceptionInformation[0] == 1) goes to the hook; registered first, before the crash handler.
 static LONG CALLBACK fault_veh(EXCEPTION_POINTERS *ep) {
     const EXCEPTION_RECORD *er = ep->ExceptionRecord;
-    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
-        return EXCEPTION_CONTINUE_SEARCH;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    if (access_hook && er->ExceptionInformation[0] <= 1 &&
+        access_hook((uint64_t)er->ExceptionInformation[1], er->ExceptionInformation[0] == 1))
+        return EXCEPTION_CONTINUE_EXECUTION;   // LOCAL (AMD)
+    if (er->ExceptionInformation[0] != 1 || !fault_hook) return EXCEPTION_CONTINUE_SEARCH;
     return fault_hook((uint64_t)er->ExceptionInformation[1]) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void fault_veh_install(void) {
+    if (!fault_veh_on) fault_veh_on = 1, AddVectoredExceptionHandler(1, fault_veh);
 }
 
 void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
     fault_hook = fn;
-    AddVectoredExceptionHandler(1, fault_veh);
+    fault_veh_install();
+}
+
+void plat_mem_access_hook(int (*fn)(uint64_t addr, int write)) {   // LOCAL (AMD)
+    access_hook = fn;
+    fault_veh_install();
 }
 
 static void (*crash_fn)(const PlatCrash *c);
@@ -639,6 +653,38 @@ static LONG WINAPI last_chance(EXCEPTION_POINTERS *ep) {
     }
     fprintf(stderr, ", working on: %s", crash_note ? crash_note : "(nothing noted)");
     fputc('\n', stderr);
+    {   // LOCAL (AMD): the innermost frames in this executable (unwound from the fault) and the faulting page's state;
+        // build/oot111/totk.map names the functions. A crash in ucrtbase's memcpy was vk_usnap_begin's copy this way.
+        MODULEINFO mi;
+        if (GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(NULL), &mi, sizeof mi)) {
+            uintptr_t exe = (uintptr_t)mi.lpBaseOfDll;
+            CONTEXT ctx = *ep->ContextRecord;
+            int nf = 0;
+            for (int i = 0; i < 256 && ctx.Rip && nf < 16; i++) {
+                if ((uintptr_t)ctx.Rip - exe < mi.SizeOfImage)
+                    fprintf(stderr, "[host] crash:   frame %2d: exe+0x%llx\n", nf++, (unsigned long long)((uintptr_t)ctx.Rip - exe));
+                DWORD64 ib = 0;
+                PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(ctx.Rip, &ib, NULL);
+                if (fe) {
+                    PVOID hd = NULL;
+                    DWORD64 est = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, ib, ctx.Rip, fe, &ctx, &hd, &est, NULL);
+                } else {   // a leaf function: its return address is at rsp
+                    if (!ctx.Rsp || !plat_mem_readable(ctx.Rsp, 8)) break;
+                    ctx.Rip = *(DWORD64 *)ctx.Rsp;
+                    ctx.Rsp += 8;
+                }
+            }
+        }
+        if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2) {
+            MEMORY_BASIC_INFORMATION mb;
+            uintptr_t at = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+            if (VirtualQuery((void *)at, &mb, sizeof mb))
+                fprintf(stderr, "[host] crash:   address 0x%llx: state %#lx protect %#lx type %#lx, region %p+%#llx\n",
+                        (unsigned long long)at, (unsigned long)mb.State, (unsigned long)mb.Protect, (unsigned long)mb.Type,
+                        mb.BaseAddress, (unsigned long long)mb.RegionSize);
+        }
+    }
     FILE *cf = crash_note && crash_path[0] ? fopen(crash_path, "a") : NULL;   // the next start avoids this work (vk_pipeline.c)
     if (cf) fprintf(cf, "%s\n", crash_note), fclose(cf);
     // A driver that runs out of memory may crash on a null pointer instead of failing: the commit numbers tell
@@ -703,6 +749,28 @@ int plat_mem_readable(uint64_t addr, uint64_t n) {
         if (a >= end) return 1;
     }
     return 1;
+}
+
+// LOCAL (AMD): one QueryWorkingSetEx for all the pages: VirtualQuery per range (plat_mem_readable) cost ~0.5 ms a call
+// inside the game's 2.4 GiB pool, where the kernel walks the page tables for the region's extent (1800 calls a frame,
+// 1 fps). Valid (bit 0 of the attributes) is set for a page that is mapped in: readable, no fault.
+int plat_mem_pages_readable(const uint64_t *pages, int n, uint8_t *ok) {
+    typedef BOOL (WINAPI *QwsEx)(HANDLE, PVOID, DWORD);
+    static QwsEx qws;
+    static int looked;
+    if (!looked) {
+        HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+        qws = k32 ? (QwsEx)(void *)GetProcAddress(k32, "K32QueryWorkingSetEx") : NULL;
+        looked = 1;
+    }
+    if (!qws || n <= 0) return 0;
+    struct { PVOID va; ULONG_PTR attr; } stack_buf[256], *buf = stack_buf;
+    if (n > 256 && !(buf = malloc((size_t)n * sizeof *buf))) return 0;
+    for (int i = 0; i < n; i++) buf[i].va = (PVOID)(uintptr_t)pages[i], buf[i].attr = 0;
+    int r = qws(GetCurrentProcess(), buf, (DWORD)((size_t)n * sizeof *buf)) ? 1 : 0;
+    for (int i = 0; i < n; i++) ok[i] = r && (buf[i].attr & 1);
+    if (buf != stack_buf) free(buf);
+    return r;
 }
 
 void *plat_aligned_alloc(size_t size, size_t align) { return _aligned_malloc(size, align); }

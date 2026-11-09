@@ -110,7 +110,11 @@ static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
     for (uint64_t r = r0; r <= r1; r++) thaw_locked(r, why);
 }
 
+static void (*thaw_hook)(uint64_t a, uint64_t n);   // LOCAL (AMD)
+void mem_thaw_hook(void (*fn)(uint64_t a, uint64_t n)) { thaw_hook = fn; }
+
 void mem_thaw(uint64_t a, uint64_t n) {
+    if (thaw_hook) thaw_hook(a, n);   // LOCAL (AMD): pages the lazy write-back keeps no-access become readable first
     plat_mutex_lock(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
     thaw_range_locked(a, n, 2);
     plat_mutex_unlock(&frz_lock);

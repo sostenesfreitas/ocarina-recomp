@@ -55,7 +55,15 @@ static const uint32_t (*c0_push)[NVN2_ROOT_WORDS];
 #define NVN_STAGE_GS 2
 #define NVN_STAGE_CS 5
 static uint8_t geometry_input;                              // normalized actual draw primitive; zero outside opt-in GS
-#define ONESHOT_WAIT_MS 1000u   // Per one-shot draw, shared across the frame on AMD.
+// LOCAL (AMD): OOT_ONESHOT_WAIT_MS=<ms> (default 1000): the budget a frame may spend waiting for the pipelines of its
+// one-shot draws (shared across the frame on AMD). Each new pipeline met in play froze the picture for up to a second
+// (frames of 1000-1100 ms in play on an RX 7800 XT); a smaller budget trades that freeze for the draw being skipped once.
+static uint32_t oot_oneshot_wait_ms(void) {
+    static long v = -1;
+    if (v < 0) { const char *e = getenv("OOT_ONESHOT_WAIT_MS"); v = e && *e ? strtol(e, NULL, 10) : 1000; if (v < 0) v = 0; }
+    return (uint32_t)v;
+}
+#define ONESHOT_WAIT_MS oot_oneshot_wait_ms()   // Per one-shot draw, shared across the frame on AMD.
 
 static void c0_lay_set(VkExec *ex, const GfxShader *cs) {
     c0_lay = gfx_shader_c0_layout(cs);
@@ -710,6 +718,8 @@ typedef struct { uint64_t serial; int stage; int used; GfxShaderAnswers a; const
 static ShaderEnt shader_tab[SHADER_SETS][SHADER_WAYS];
 
 static void oot_tonemap_exposure(VkExec *ex, VkDescriptorBufferInfo *bi);
+static int oot_tonemap_prog(VkExec *ex);
+static float oot_ev_scale(void);
 static int find_stage_scan(const prog_t *p, int nvn_stage, const uint8_t **ctl, const uint8_t **code, uint32_t *len) {
     for (uint32_t i = 0; i < p->nstage && i < 6; i++) {
         const uint8_t *c = p->sd[i].control;
@@ -990,7 +1000,18 @@ static void count_use(int cls, int use, uint64_t n) {
 // aligned, a copy in transient memory when the backing is host memory with an unaligned offset. 0 when neither works.
 // written: the shader stores into it (a mirror's range goes back to guest memory at the end of the submission).
 // direct_only: guarded aliases must share the real backing; a transient copy would lose writes and alias coherence.
-#define WRITTEN_CAP (8ull << 20)
+// LOCAL (AMD, test): OOT_WRITTEN_CAP_KIB=<KiB>: the written mark of a guarded binding (default 8 MiB, as upstream)
+static uint64_t written_cap(void) {
+    static uint64_t cap;
+    if (!cap) {
+        const char *e = getenv("OOT_WRITTEN_CAP_KIB");
+        long k = e && *e ? atol(e) : 0;
+        cap = k > 0 ? (uint64_t)k << 10 : 8ull << 20;
+        if (k > 0) rt_log("vk: a guarded storage binding counts %ld KiB as written (OOT_WRITTEN_CAP_KIB)", k);
+    }
+    return cap;
+}
+#define WRITTEN_CAP (written_cap())
 static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, uint64_t max, int use, int written,
                       int direct_only, VkDescriptorBufferInfo *out) {
     VkMemSpan sp;
@@ -1042,6 +1063,7 @@ static void c0_table(uint8_t *at, const p_bind_buf b[16]) {
 // uniform and storage buffers, following stored pointers two levels down. ponytail: only stored pointers near the start of
 // a buffer are followed and each binding stops at 32 MiB; a real fix would give shaders the guest address space.
 #define DYN_C0 NVN2_C0_LIST
+_Static_assert(NVN2_C0_LIST == 0x900, "spv_guarded_loop.h GLOOP_C0_LIST must follow NVN2_C0_LIST");   // LOCAL (AMD)
 #define DYN_N 32
 _Static_assert(0x770 + 16 * 16 <= DYN_C0, "native mesh table overlaps candidates");
 _Static_assert(DYN_C0 + DYN_N * 16 <= VK_C0_BYTES, "candidate list exceeds bank");
@@ -1168,6 +1190,15 @@ static void dyn_collect(VkExec *ex, const VkPipeInfo *info, int st) {
     }
 }
 
+// LOCAL (AMD): OOT_GLOOP_PAGES: the GPU page table's address, page shift and entry count at NVN2_C0_PAGES (vk_memory.c)
+static void c0_pages(uint8_t bank[VK_C0_BYTES]) {
+    if (!vk_mem_pages_on()) return;
+    uint32_t shift = 0, entries = 0;
+    uint64_t a = vk_mem_pages_addr(&shift, &entries);
+    uint32_t w[4] = {(uint32_t)a, (uint32_t)(a >> 32), shift, entries};
+    memcpy(bank + NVN2_C0_PAGES, w, 16);
+}
+
 void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
                 const uint32_t dispatch[3], uint32_t base_instance) {
     if (stage == NVN_STAGE_CS && c0_lay) {
@@ -1175,6 +1206,7 @@ void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16],
             rt_fatal("vk: invalid NVN 2 compute parameter-block layout");
         memcpy(bank, dispatch, 12);   // LOCAL TEST (Ocarina): the first words of the bank are the dispatch size (the sky ambient divides by them)
         memcpy(bank + DYN_C0, dyn_lists[stage], sizeof dyn_lists[stage]);
+        c0_pages(bank);   // LOCAL (AMD): OOT_GLOOP_PAGES
         return;
     }
     memset(bank, 0, VK_C0_BYTES);
@@ -1185,6 +1217,7 @@ void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16],
     if (stage == NVN_STAGE_VS || stage == 4) c0_table(bank + 0x770, ssbo);   // LOCAL TEST (Ocarina): the mesh stage's table (seedds/nxnative 5ae0d9aea)
     // The synthetic list follows every native table, including all 16 mesh storage slots.
     if (stage >= 0 && stage < 6 && dyn_lists[stage][0].addr) memcpy(bank + DYN_C0, dyn_lists[stage], sizeof dyn_lists[stage]);
+    c0_pages(bank);   // LOCAL (AMD): OOT_GLOOP_PAGES
     if (stage == 3) return;   // a task stage: its table is at c0+0x670; nothing else of this bank is used
     if (stage == NVN_STAGE_CS) {
         memcpy(bank + 0x200, dispatch, 12);
@@ -1291,6 +1324,22 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
             if (st == NVN_STAGE_FS && slot == 3 && ex->prog) oot_tonemap_exposure(ex, &bi);
             return bi;
         }
+        // LOCAL (AMD): the snapshot refused this binding (not an imported pool: 0.5-0.7 per submission here). For the tone
+        // map's c3 the exposure must still be set, or that frame comes out brighter (visible flicker): its bytes go through
+        // a scratch copy that gets the same value.
+        if (st == NVN_STAGE_FS && slot == 3 && ex->prog && b->size >= 64 && b->size <= max && oot_tonemap_prog(ex) && oot_ev_scale() != 0) {
+            VkBuffer sb;
+            VkDeviceSize so;
+            uint64_t n = (b->size + 15) & ~15ull;
+            uint8_t *m = scratch(ex, n, &sb, &so);
+            memcpy(m, (const void *)(uintptr_t)b->addr, b->size);
+            if (n > b->size) memset(m + b->size, 0, n - b->size);
+            float z, sc = oot_ev_scale();
+            memcpy(&z, m + 56, 4);
+            if (z == 1.0f) memcpy(m + 56, &sc, 4);
+            RS.volatile_ = 1;
+            return (VkDescriptorBufferInfo){sb, so, n};
+        }
         if (bind_range(ex, b->addr, b->size, align, max, VK_MUSE_UBO, 0, 0, &bi)) return bi;
     }
     return zero_info(max);
@@ -1304,21 +1353,29 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
 // camera; the passes before the tone map do not change). The scale is set here, in the uniform snapshot, while the
 // game's is 1 (EV 0): reading the guest's view objects every present stalled on the GPU and halved the frame rate.
 // OOT_EV (main.c game_defaults: -1.25); OOT_EV=0 keeps the old picture.
-static void oot_tonemap_exposure(VkExec *ex, VkDescriptorBufferInfo *bi) {
+static float oot_ev_scale(void) {
     static float scale = -1;
-    static const void *last_prog;
-    static int last_hit;
     if (scale < 0) {
         const char *e = getenv("OOT_EV");
         scale = e && atof(e) != 0 ? exp2f((float)atof(e)) : 0;
     }
-    if (!scale) return;
+    return scale;
+}
+static int oot_tonemap_prog(VkExec *ex) {
+    static const void *last_prog;
+    static int last_hit;
     if (ex->prog != last_prog) {   // the same program is bound for many draws: look its fragment stage up once
         const uint8_t *tctl, *tcode;
         uint32_t tlen;
         last_prog = ex->prog;
         last_hit = find_stage(ex->prog, NVN_STAGE_FS, &tctl, &tcode, &tlen) && nvn2_origin(tcode) == 0x73320e720a317817ull;
     }
+    return last_hit;
+}
+static void oot_tonemap_exposure(VkExec *ex, VkDescriptorBufferInfo *bi) {
+    float scale = oot_ev_scale();
+    if (!scale) return;
+    int last_hit = oot_tonemap_prog(ex);
     if (!last_hit || bi->range < 64) return;
     uint8_t *m = vk_usnap_map(bi);
     float z;
@@ -1403,7 +1460,10 @@ static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
 static p_bind_buf guarded_storage_binding(const VkExec *ex, int st, const GfxShaderRes *r) {
     uint64_t off = (uint64_t)r->handle * 4;
     p_bind_buf b = {0};
-    if (st == NVN_STAGE_CS && !c0_lay) return b;
+    if (st == NVN_STAGE_CS && !c0_lay) {   // LOCAL (AMD, debug): a guarded compute binding with no c0 layout is empty
+        static int told; if (told++ < 8) rt_log("vk: guarded compute binding without a c0 layout: program %llu c%d+%#x", ex->prog ? (unsigned long long)ex->prog->serial : 0ull, r->cbuf_slot, r->handle * 4);
+        return b;
+    }
     if (st != NVN_STAGE_CS) {   // LOCAL TEST (Ocarina): OOT_GFX_GUARD: stages allowed (1 VS, 2 FS, 4 mesh)
         static int mask = -1;
         if (mask < 0) { const char *e = getenv("OOT_GFX_GUARD"); mask = e ? atoi(e) : 7; }
@@ -2485,7 +2545,8 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         }
         if (need_w) {
             w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                          .dstBinding = b->binding, .descriptorCount = cnt, .descriptorType = b->type};
+                                          .dstBinding = b->binding, .dstArrayElement = b->elem,   // LOCAL (AMD): OOT_GUARDED_LOOP
+                                          .descriptorCount = cnt, .descriptorType = b->type};
             if (kind == 0) w[i].pBufferInfo = &o->buffer;   // a VkDescSlot is as large as either info struct
             else if (kind == 1) w[i].pImageInfo = &o->image;
             else w[i].pTexelBufferView = &bv[nd];
@@ -2946,7 +3007,13 @@ static void motion_probe(VkExec *ex) {
     if (hit) oot_motion_note(ex);
 }
 
+// LOCAL (AMD, measurement): OOT_REPLAY_PROF=1: ns per phase of a draw (vk_exec.c rp_report prints them).
+int oot_rp_on;
+int64_t oot_rp_draw[8];
+uint64_t oot_rp_draws;
+#define RPD(k) do { if (rpd_t) { int64_t _n = (int64_t)kern_now_ns(); oot_rp_draw[k] += _n - rpd_t; rpd_t = _n; } } while (0)
 static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
+    int64_t rpd_t = oot_rp_on > 0 ? (int64_t)kern_now_ns() : 0;
     motion_probe(ex);
     {   // LOCAL TEST (Ocarina): OOT_ONLY_MESH=1: in the full-resolution passes, only mesh draws, to see what they produce
         static int only = -1;
@@ -3013,6 +3080,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         if (memo && vs && !vs_wait && !fs_wait && !gs_wait && (!has_fs || fs) && (!want_gs || (has_gs && gs)))
             memo_key(ex, gen, &SM.k), SM.vs = vs, SM.fs = fs, SM.gs = gs, SM.has_fs = has_fs, SM.has_gs = has_gs, SM.valid = 1;
     }
+    RPD(0);
     {   // LOCAL TEST (Ocarina): a stage that did not lower keeps its NVN 2 control and is not found: the draw loses it silently
         static uint64_t seen[2048];
         static int nseen;
@@ -3209,6 +3277,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     }
     if (pending) return draw_why(ex, "pipeline pending"), 0;   // a background worker is building it: the draw is skipped until it is ready
     if (!p || !info) return warn_once(W_PIPELINE, "a graphics pipeline could not be created: draws with it are skipped"), 0;
+    RPD(1);
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
         vk_pipeline_set_dynamic(ex->cb, &s);
@@ -3233,6 +3302,11 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     {   // LOCAL TEST (Ocarina): OOT_SKIP_GUARDED=1 drops the draws of graphics programs with guarded candidates
         static int skip_g = -1;
         if (skip_g < 0) { const char *e = getenv("OOT_SKIP_GUARDED"); skip_g = e ? atoi(e) : 0; }   // 1 all, 2 mesh draws, 3 other draws
+        // LOCAL (AMD): OOT_SKIP_GUARDED_PASS=<w>x<h>: the guarded draws of passes of that size only are dropped (the other
+        // draws of the pass stay): the 1600x1600 pass in front of the forest costs 57-60 ms of GPU on an RX 7800 XT.
+        static int skip_gw = -1, skip_gh;
+        if (skip_gw < 0) { const char *e = getenv("OOT_SKIP_GUARDED_PASS"); skip_gw = 0; if (e) sscanf(e, "%dx%d", &skip_gw, &skip_gh); }
+        int skip_gpass = skip_gw && (int)ex->pass_w == skip_gw && (int)ex->pass_h == skip_gh;
         static uint64_t seen_g[64];
         static int nseen_g;
         for (uint32_t i = 0; i < info->n_bindings; i++) {
@@ -3247,22 +3321,27 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
                        (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
             }
             int in_fs = nvn_stage_of(info->bindings[i].stage) == NVN_STAGE_FS;
-            if (skip_g == 1 || (skip_g == 2 && draw_is_mesh) || (skip_g == 3 && !draw_is_mesh) ||
+            if (skip_gpass || skip_g == 1 || (skip_g == 2 && draw_is_mesh) || (skip_g == 3 && !draw_is_mesh) ||
                 (skip_g == 4 && !draw_is_mesh && in_fs) || (skip_g == 5 && !draw_is_mesh && !in_fs)) return 0;
             if (skip_g < 4) break;
         }
     }
+    RPD(2);
     dyn_collect(ex, info, NVN_STAGE_VS);   // LOCAL TEST (Ocarina): graphics stages with guarded candidates (translator patch 0025)
     dyn_collect(ex, info, NVN_STAGE_FS);
     dyn_collect(ex, info, 3);
     dyn_collect(ex, info, 4);
+    RPD(3);
     bindless_bind(ex, info);
     bind_resources(ex, info);
+    RPD(4);
     if (fbl & ex->fb_dirty) feedback_barrier(ex);
     feedback_written(ex, &s);
     bind_vertex_buffers(ex);
     if (vk_dump_armed) vk_dump_draw(ex, &s, p, info);
     vk_exec_oq_draw(ex);
+    RPD(5);
+    if (rpd_t) oot_rp_draws++;
     return 1;
 }
 
@@ -3379,6 +3458,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     int restart = restart_for(ex, d->prim, d->itype);
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, restart)) return;
     vk_exec_frame.draws++;
+    int64_t rpd_t = oot_rp_on > 0 ? (int64_t)kern_now_ns() : 0;
     uint64_t bytes = (uint64_t)d->count * isize[d->itype];
     VkMemSpan sp;
     if (!vk_mem_resolve(d->ibuf, bytes, &sp)) return warn_once(W_INDEX, "index buffer %#llx is not backed: draws with it are skipped", (unsigned long long)d->ibuf);
@@ -3406,6 +3486,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     int ds_open = ds_begin(ex, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1);
     vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
                      (uint32_t)d->base_instance);
+    RPD(6);
     vk_prof_mark(ex, "draw", ex->prog ? ex->prog->serial : 0);
     ex->recorded++;
     note_work(ex, 0, (uint64_t)d->count * (uint64_t)(d->instances > 0 ? d->instances : 1));
@@ -3622,7 +3703,21 @@ static int mesh_args(VkExec *ex, const VkMemSpan *ip, VkDeviceSize *offset) {
     return 1;
 }
 
+int vk_exec_read_vkbuf(VkExec *ex, VkBuffer src, VkDeviceSize src_off, uint64_t size, void *out);   // vk_exec.c, debug
+// LOCAL (AMD, debug): OOT_MESH_RING: the previous indirect mesh draw's {x, y, z}, read before this draw prepares anything
+// (the read splits the command buffer; prepare_draw then binds everything again)
+static int ring_pending, ring_logged;
+static VkDeviceSize ring_pending_off;
+static uint64_t ring_pending_prog, ring_pending_ind, ring_pending_frame;
 static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
+    if (ring_pending) {
+        ring_pending = 0;
+        ring_logged++;
+        uint32_t xyz[3] = {0};
+        int okr = vk_exec_read_vkbuf(ex, mesh_ring, ring_pending_off, 12, xyz);
+        rt_log("mesh-ring f %llu prog %llu rec %#llx ok %d: %u %u %u", (unsigned long long)ring_pending_frame,
+               (unsigned long long)ring_pending_prog, (unsigned long long)ring_pending_ind, okr, xyz[0], xyz[1], xyz[2]);
+    }
     static PFN_vkCmdDrawMeshTasksIndirectEXT fn;
     if (!vk_ctx()->has_mesh_shader) return;
     if (!fn) fn = (PFN_vkCmdDrawMeshTasksIndirectEXT)vkGetDeviceProcAddr(vk_ctx()->device, "vkCmdDrawMeshTasksIndirectEXT");
@@ -3705,6 +3800,13 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
         return;
     }
     mesh_first_buf = VK_NULL_HANDLE;
+    {   // LOCAL (AMD, debug): OOT_MESH_RING=<present>: this draw's {x, y, z} is read back at the start of the next one
+        static long at = -2;
+        if (at == -2) { const char *e = getenv("OOT_MESH_RING"); at = e ? atol(e) : -1; }
+        if (ok && at >= 0 && mesh_ring && !mesh_old && !getenv("OOT_MESH_DIRECT") && (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) >= at && ring_logged < 90)
+            ring_pending = 1, ring_pending_off = mesh_off, ring_pending_prog = ex->prog ? ex->prog->serial : 0, ring_pending_ind = d->ind,
+            ring_pending_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    }
     if (da_on()) rt_log("draw args: mesh past args prog %llu", ex->prog ? (unsigned long long)ex->prog->serial : 0ull);
     if (da_on()) rt_log("draw args: mesh prepare prog %llu ok %d pass %ux%u", ex->prog ? (unsigned long long)ex->prog->serial : 0ull, ok, ex->pass_w, ex->pass_h);
     if (!ok) return;
@@ -3720,7 +3822,11 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
         } else {
             static int nodraw = -1;   // OOT_MESH_NODRAW=1: everything but the draw itself, to see which shaders these programs use
             if (nodraw < 0) nodraw = getenv("OOT_MESH_NODRAW") != NULL;
-            if (nodraw) return;
+            // LOCAL (AMD): OOT_SKIP_MESH_PASS=<w>x<h>: no mesh draws in passes of that size (the vegetation drawn into the
+            // 1600x1600 pass cost 48-60 ms of GPU per frame in front of the forest on an RX 7800 XT: 12 -> 29 fps without)
+            static int skip_mw = -1, skip_mh;
+            if (skip_mw < 0) { const char *e = getenv("OOT_SKIP_MESH_PASS"); skip_mw = 0; if (e) sscanf(e, "%dx%d", &skip_mw, &skip_mh); }
+            if (nodraw || (skip_mw && (int)ex->pass_w == skip_mw && (int)ex->pass_h == skip_mh)) return;
             int ds_open = ds_begin(ex, 0, 0);
             rec_mesh_ind(fn, ex->cb, mesh_old ? ip.buffer : mesh_ring, mesh_old ? ip.offset : mesh_off, 1, sizeof(VkDrawMeshTasksIndirectCommandEXT));
             if (ds_open) ds_end(ex);
@@ -4210,7 +4316,63 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
                 vk_exec_barrier(ex);
             }
         }
+        {   // LOCAL (AMD, debug): OOT_TRACE_CS=<hex>[,<hex>]: every dispatch of those origins, with its frame and groups
+            static uint64_t tr[4]; static int ntr = -1, trn;
+            if (ntr < 0) { ntr = 0; const char *e = getenv("OOT_TRACE_CS"); for (char *end; e && *e && ntr < 4; e = *end ? end + 1 : end) tr[ntr++] = strtoull(e, &end, 16); }
+            static long trf = -2; if (trf == -2) { const char *e = getenv("OOT_TRACE_CS_FROM"); trf = e ? atol(e) : 0; }
+            uint64_t trfr = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+            for (int i = 0; i < ntr; i++) if (tr[i] == origin && (long)trfr >= trf && trn < 400) trn++, rt_log("cs trace: origin %016llx frame %llu groups %dx%dx%d", (unsigned long long)origin, (unsigned long long)trfr, d->x, d->y, d->z);
+            {   // OOT_TRACE_CS_ALL=1: each distinct origin dispatched from OOT_TRACE_CS_FROM on, once, with its size
+                static int all = -1; static uint64_t seen_a[512]; static int nseen_a;
+                if (all < 0) all = getenv("OOT_TRACE_CS_ALL") != NULL;
+                if (all && (long)trfr >= trf) { int k = 0; for (int i = 0; i < nseen_a; i++) k |= seen_a[i] == origin; if (!k && nseen_a < 512) { seen_a[nseen_a++] = origin; uint64_t fw2 = 0; gfx_shader_spirv(cs, &fw2); rt_log("cs forest: origin %016llx %llu words groups %dx%dx%d frame %llu", (unsigned long long)origin, (unsigned long long)fw2, d->x, d->y, d->z, (unsigned long long)trfr); } }
+            }
+        }
+        {   // LOCAL (AMD): OOT_CS_SKIP_FIRST=<n>:<hex origin>[,...]: the first n dispatches of each are skipped (as in runs
+            // where the fog and light volume shaders were still compiling at first, their accumulation empty for the session)
+            static uint64_t sf[8];
+            static uint32_t sf_n[8];
+            static int nsf = -1;
+            static long sf_first;
+            if (nsf < 0) {
+                nsf = 0;
+                const char *e = getenv("OOT_CS_SKIP_FIRST"), *colon = e ? strchr(e, ':') : NULL;
+                sf_first = e ? atol(e) : 0;
+                for (char *end, *q = colon ? (char *)colon + 1 : NULL; q && *q && nsf < 8; q = *end == ',' ? end + 1 : end) {
+                    sf[nsf] = strtoull(q, &end, 16);
+                    if (end == q) break;
+                    nsf++;
+                }
+                if (sf_first <= 0) nsf = 0;
+                if (nsf) rt_log("vk: the first %ld dispatches of %d compute programs are skipped (OOT_CS_SKIP_FIRST)", sf_first, nsf);
+            }
+            for (int i = 0; i < nsf; i++)
+                if (sf[i] == origin && sf_n[i] < (uint32_t)sf_first) { sf_n[i]++; return; }
+        }
+        {   // LOCAL (AMD): OOT_CS_EVERY=<hex origin>[,<hex origin>]:<n>: those dispatches run on one frame in n, the other
+            // frames skip them (the vegetation setup costs ~170 ms a frame on RDNA 3 through the title and menus: 256 VGPRs
+            // and ~11 KB of scratch a lane, AMD's compiler spilling the inlined helpers)
+            static uint64_t ev[4];
+            static int nev = -1;
+            static long every = 1;
+            if (nev < 0) {
+                nev = 0;
+                const char *e = getenv("OOT_CS_EVERY"), *colon = e ? strrchr(e, ':') : NULL;
+                every = colon ? atol(colon + 1) : 1;
+                for (char *end; e && *e && e != colon && nev < 4; e = *end == ',' ? end + 1 : end) {
+                    ev[nev] = strtoull(e, &end, 16);
+                    if (end == e) break;
+                    nev++;
+                }
+                if (every < 2) nev = 0;
+                if (nev) rt_log("vk: %d compute programs run on one frame in %ld (OOT_CS_EVERY)", nev, every);
+            }
+            uint64_t fr_ = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+            for (int i = 0; i < nev; i++)
+                if (ev[i] == origin && fr_ % (uint64_t)every != 0) return;
+        }
         for (int i = 0; i < nskip; i++) if (skip[i] == origin) {
+            { static uint64_t told_o[32]; static int ntold_o; int w = 0; for (int t = 0; t < ntold_o; t++) w |= told_o[t] == origin; if (!w && ntold_o < 32) told_o[ntold_o++] = origin, rt_log("vk: dispatch skipped by DKB_SKIP_CS: origin %016llx (%u dispatches listed)", (unsigned long long)origin, (unsigned)nskip); }   // LOCAL (AMD) trace
             { uint64_t f_ = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED); if (f_ >= 1798 && f_ <= 1800) rt_log("vk: skip in frame %llu: %016llx caller %#llx", (unsigned long long)f_, (unsigned long long)origin, (unsigned long long)d->caller); }
             static uint64_t told[32];
             static int ntold;
@@ -4282,6 +4444,16 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
         uint64_t origin = find_stage(ex->prog, NVN_STAGE_CS, &cctl, &ccode, &clen) ? nvn2_origin(ccode) : 0;
         vk_pipeline_big_cs_met(cs, origin);
         int known = 0;
+        {   // LOCAL (AMD, debug): OOT_TRACE_CS, indirect dispatches
+            static uint64_t tr2[4]; static int ntr2 = -1, trn2; static long trf2 = -2;
+            if (ntr2 < 0) { ntr2 = 0; const char *e = getenv("OOT_TRACE_CS"); for (char *end; e && *e && ntr2 < 4; e = *end ? end + 1 : end) tr2[ntr2++] = strtoull(e, &end, 16); const char *f2 = getenv("OOT_TRACE_CS_FROM"); trf2 = f2 ? atol(f2) : 0; }
+            uint64_t fr2 = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+            for (int i = 0; i < ntr2; i++) if (tr2[i] == origin && (long)fr2 >= trf2 && trn2 < 400) trn2++, rt_log("cs trace: origin %016llx frame %llu INDIRECT args %#llx", (unsigned long long)origin, (unsigned long long)fr2, (unsigned long long)d->ind);
+            {   static int all2 = -1; static uint64_t seen_b[512]; static int nseen_b;
+                if (all2 < 0) all2 = getenv("OOT_TRACE_CS_ALL") != NULL;
+                if (all2 && (long)fr2 >= trf2) { int k = 0; for (int i = 0; i < nseen_b; i++) k |= seen_b[i] == origin; if (!k && nseen_b < 512) { seen_b[nseen_b++] = origin; uint64_t fw3 = 0; gfx_shader_spirv(cs, &fw3); rt_log("cs forest: origin %016llx %llu words INDIRECT frame %llu", (unsigned long long)origin, (unsigned long long)fw3, (unsigned long long)fr2); } }
+            }
+        }
         for (int i = 0; i < nseen; i++) known |= seen[i] == origin;
         if (!known && nseen < 1024) {
             seen[nseen++] = origin;

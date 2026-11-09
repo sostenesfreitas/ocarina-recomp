@@ -301,12 +301,18 @@ static void series_shot(const tex_t *t, uint64_t n) {
 // A --seconds run ends at the first present after the world clock (game time since the save's first frame,
 // frame_step_world_us) passed S seconds, so a run covers the same game time at any frame rate; any other frame is
 // counted by the back end only.
+void vk_present_capture(int on);                 // gfx_present.c
+int vk_present_save_capture(const char *path);   // LOCAL (AMD, debug): OOT_SHOT_SWAPCHAIN
 void rt_frame_presented(const tex_t *t, uint64_t n) {
     const RtConfig *cfg = rt_config();
+    static const char *swap_shot;   // LOCAL (AMD, debug): OOT_SHOT_SWAPCHAIN=<png>: the swapchain (overlay included) at the end too
+    static int swap_init;
+    if (!swap_init) { swap_init = 1; swap_shot = cfg->shot ? getenv("OOT_SHOT_SWAPCHAIN") : NULL; if (swap_shot && *swap_shot) vk_present_capture(1); }
     series_shot(t, n);
     int64_t w = cfg->seconds ? frame_step_world_us() : -1;
     if (w < 0 || (double)w < cfg->seconds * 1e6) return;
     if (cfg->shot) save_shot(t, cfg->shot);
+    if (cfg->shot && swap_shot && *swap_shot) rt_logf("boot: swapchain shot %s: %s\n", swap_shot, vk_present_save_capture(swap_shot) ? "saved" : "no capture");
     GfxStats g = gfx_stats();
     rt_logf("boot: frames %llu presented (nvn calls %llu, distinct %llu, unimplemented %llu, validation errors %llu, "
            "shader failures %llu, draws skipped %llu)\n", (unsigned long long)g.frames,

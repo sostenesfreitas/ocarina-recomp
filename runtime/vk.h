@@ -228,6 +228,9 @@ void vk_mem_dirty_submit(void);                   // vk_sync_submit, under its l
 // buffer with vk_mem_mirror_prologue and submits it right before each part.
 extern int vk_mirror_on;
 void vk_mem_use(VkMemSpan *sp);
+// LOCAL (AMD): OOT_GLOOP_PAGES: the GPU page table (vk_memory.c): on, and its device address with the page shift and count
+int vk_mem_pages_on(void);
+uint64_t vk_mem_pages_addr(uint32_t *shift, uint32_t *entries);
 void vk_mem_pick(VkMemSpan *sp);
 #define VK_MEM_USE(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_use(&(sp)); } while (0)
 #define VK_MEM_PICK(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_pick(&(sp)); } while (0)
@@ -515,6 +518,8 @@ typedef struct {
     VkShaderStageFlags stages;
     const GfxShaderRes *res;               // the stage's reflection entry; NULL for the support buffer
     uint8_t set;                           // descriptor set: 0, or 1 for the fragment stage with independent layouts
+    uint16_t elem;                         // LOCAL (AMD): its array element in `binding` (OOT_GUARDED_LOOP merges a
+                                           // shader's guarded candidates' storage buffers into one array; 0 otherwise)
 } VkPipeBinding;
 typedef struct {
     VkPipeline pipeline;                   // VK_NULL_HANDLE when creation failed

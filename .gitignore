@@ -83,3 +83,9 @@ tools/data/oot-seed/
 
 # LOCAL TEST (Ocarina): the input jogar\jogar-perfil-gpu.ps1 records
 /entrada-gravada.txt
+
+# AMD debug dumps (OOT_PIPE_DUMP, OOT_DUMP_CS_WORDS, OOT_DUMP_MODULE_WORDS): the game's shaders, never committed
+pipe-dump-*/
+module-cs-*.spv
+module-final-*.spv
+module-pre-*.spv

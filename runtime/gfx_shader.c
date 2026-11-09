@@ -1200,7 +1200,12 @@ static int reflect(GfxShader *s, int flags) {
                 if (*q++ != (i + 1 == n ? ']' : ',')) return 0;
             }
         }
-        if (!nvn2_c0_valid(&s->c0, NVN2_C0_LIST)) return 0;   // the same bound the dispatch packs against, so a bad layout fails here
+        if (!nvn2_c0_valid(&s->c0, NVN2_C0_LIST)) {   // the same bound the dispatch packs against, so a bad layout fails here
+            rt_log("gfx_shader: c0 layout rejected: ubos %u ssbos %u textures %u images %u roots %u %u %u %u %u %u %u %u, end %#zx > %#x (LOCAL AMD debug)",
+                   s->c0.ubos, s->c0.ssbos, s->c0.textures, s->c0.images, s->c0.roots[0], s->c0.roots[1], s->c0.roots[2], s->c0.roots[3], s->c0.roots[4], s->c0.roots[5], s->c0.roots[6], s->c0.roots[7],
+                   nvn2_c0_part(&s->c0, 5), (unsigned)NVN2_C0_LIST);
+            return 0;
+        }
         s->has_c0 = 1;
     }
     if (require_c0 && !s->has_c0) {

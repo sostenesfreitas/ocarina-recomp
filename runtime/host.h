@@ -57,6 +57,7 @@ void perf_gpu_wait(uint64_t t0);                // a wait for a GPU fence ended 
 typedef struct {
     int have_gpu, have_vram, vram_exact;
     uint64_t gpu_ns, gpu_parts, gpu_missed;     // busy time, submission parts timed, parts left untimed
+    uint64_t gpu_copy_ns;                       // LOCAL (AMD): of gpu_ns, the mirror-copy prologues (no draws)
     uint64_t vram_used, vram_budget;
     uint64_t up_gpu_ns, up_timed, up_batches, up_wait_ns, up_bytes;   // upload batches (vk_memory.c, vk_upload_perf)
 } PerfGpu;
@@ -165,6 +166,7 @@ int mem_freeze(uint64_t a);                                // makes the 2 MiB re
                                                            // mem_thaw thaws it; 1 frozen (or already), 0 refused
 int mem_frozen(uint64_t a);                                // the 2 MiB region of a is frozen: no page in it changed
                                                            // since its freeze
+void mem_thaw_hook(void (*fn)(uint64_t a, uint64_t n));   // LOCAL (AMD): called first by mem_thaw (vk_memory.c lazy write-back)
 void mem_thaw(uint64_t a, uint64_t n);                     // makes the frozen regions over [a, a+n) writable again;
                                                            // before a kernel write (file read) into guest memory
 void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws);

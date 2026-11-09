@@ -43,6 +43,9 @@
 // table @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou); the binding conventions are those of Ryujinx's shader translator
 // (MIT, tools/vendor/ryujinx).
 #include <stdio.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -52,6 +55,8 @@
 #include "nvn_hmap.h"
 #include "platform/platform.h"
 #include "tex.h"
+#define GLOOP_PAGES_DEFAULT (vk_caps.amd)   // LOCAL (AMD): OOT_GLOOP_PAGES default on AMD (vk_memory.c vk_mem_pages_on)
+#include "spv_guarded_loop.h"   // LOCAL (AMD): OOT_GUARDED_LOOP
 
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
 
@@ -116,6 +121,8 @@ typedef struct Layout {
     uint32_t n0;                       // independent layouts: b[0..n0) are set 0, the rest set 1
     VkPipelineLayout half[2];          // GPL libraries: {set 0, null}, {null, set 1} (made on first use)
     VkDescriptorUpdateTemplate tpl[2]; // per set (make_tpl); VK_NULL_HANDLE: written with write structs
+    uint8_t tbl[MAX_BINDINGS];         // LOCAL (AMD): OOT_GUARDED_LOOP: b[i] is element tbl[i] - 1 of an array (0: not)
+    uint32_t tbl_first[4], ntbl;       // the arrays' bindings (their first element's), at most 4
     VkDescriptorSetLayoutBinding b[];
 } Layout;
 
@@ -224,6 +231,37 @@ static void cache_publish(VkPipelineCache source) {
     __atomic_add_fetch(&cache_updates, 1, __ATOMIC_RELAXED);
     plat_mutex_unlock(&deferred_access);
     if (source) vkDestroyPipelineCache(P.device, source, NULL);
+}
+
+// LOCAL (AMD): OOT_PIPE_OWN_CACHE (default on AMD): every pipeline built in an empty cache of its own, published into
+// the shared one afterwards (cache_publish). AMD's driver builds the pipelines of one VkPipelineCache one at a time:
+// with a cold cache, guarded pipelines of 5-30 s each queued every other build behind them, and the replay thread
+// waited 20-130 s for a compute pipeline (RX 7800 XT; on v0.2.1 the same 1-4 min stalls went to none over 1.4 s with
+// own caches). The private caches above cover the large jobs only. Unseeded, unlike cache_private: seeding copies the
+// whole shared cache per build, and the driver's own disk cache finds what it compiled before anyway.
+static VkPipelineCache oot_own_cache(void) {
+    static volatile int32_t on = -1;
+    int v = __atomic_load_n(&on, __ATOMIC_ACQUIRE);
+    if (v < 0) {
+        const char *e = getenv("OOT_PIPE_OWN_CACHE");
+        int want = e && *e ? *e != '0' : vk_caps.amd;
+        int32_t expect = -1;
+        if (__atomic_compare_exchange_n(&on, &expect, want, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) && want)
+            rt_log("vk_pipeline: every pipeline built in a cache of its own, published into the shared one (OOT_PIPE_OWN_CACHE%s)",
+                   e && *e ? "" : ", default on AMD");
+        v = __atomic_load_n(&on, __ATOMIC_ACQUIRE);
+    }
+    VkPipelineCache own = VK_NULL_HANDLE;
+    if (!v || !P.cache) return own;
+    VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    if (vkCreatePipelineCache(P.device, &ci, NULL, &own) != VK_SUCCESS) own = VK_NULL_HANDLE;
+    return own;
+}
+
+static void oot_own_done(VkPipelineCache own, int built) {
+    if (!own) return;
+    if (built) cache_publish(own);
+    else vkDestroyPipelineCache(P.device, own, NULL);
 }
 
 static void cache_path_init(void) {
@@ -1241,6 +1279,7 @@ static void pin_subgroup32(VkPipelineShaderStageCreateInfo *st, VkPipelineShader
 }
 
 static int spirv_is_mesh(const uint32_t *w, uint64_t n);
+static uint32_t *oot_mesh_drop_wg_init(const uint32_t *w, uint64_t n, uint64_t *out_n);   // LOCAL (AMD)
 static uint64_t spv_fnv(const uint32_t *w, uint64_t words) {
     uint64_t h = 0xcbf29ce484222325ull;
     const uint8_t *b = (const uint8_t *)w;
@@ -1280,8 +1319,12 @@ static uint32_t *spirv_nan_minmax(const uint32_t *w, uint64_t n) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (i + len > n) break;
         if (op == 15 && w[i + 1] == 5) {   // OpEntryPoint GLCompute
-            free(o);
-            return NULL;
+            static int cs_too = -1;   // LOCAL (AMD): OOT_NANMINMAX_CS=1: compute shaders too (culling counts test)
+            if (cs_too < 0) { const char *e = getenv("OOT_NANMINMAX_CS"); cs_too = e && *e == '1'; }
+            if (!cs_too) {
+                free(o);
+                return NULL;
+            }
         }
         if (op == 11 && len >= 3 && !memcmp(&w[i + 2], "GLSL.std.450", 12)) glsl = w[i + 1];
         if (op == 12 && len >= 5 && glsl && w[i + 3] == glsl) {
@@ -1299,6 +1342,86 @@ static uint32_t *spirv_nan_minmax(const uint32_t *w, uint64_t n) {
     return o;
 }
 
+// Intel and AMD: every GLSL.std.450 Sqrt(x) becomes Sqrt(NMax(x, 0)). NVIDIA keeps an FMA single-rounded, so a value the
+// console computes as exactly 0 can come out slightly negative elsewhere, and its Sqrt is NaN: the HDR encode compute (prog 102)
+// then draws black leaves and silhouettes (issue #49). NMax also turns a NaN operand into 0. A copy of the module with a new
+// bound, or NULL when there is no Sqrt. Off by default in this branch (untested on AMD): OOT_SQRT_CLAMP=1 applies it
+// to compute shaders, =2 to every stage as upstream PR #91 does (the driver rebuilds each changed pipeline once).
+// (Upstream PR #91, AlfaDev23.)
+static uint32_t *spirv_sqrt_clamp(const uint32_t *w, uint64_t n, uint64_t *out_n) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("OOT_SQRT_CLAMP");
+        on = e && *e ? atoi(e) : 0;   // LOCAL (AMD): off here (untested on AMD; =2 every stage, as PR #91 has it)
+    }
+    if (!on || !w || n < 5) return NULL;
+    if (on == 1) {   // only a module whose entry point is GLCompute
+        int compute = 0;
+        for (uint64_t i = 5; i < n && w[i] >> 16; i += w[i] >> 16)
+            if ((w[i] & 0xffff) == 15) { compute = w[i + 1] == 5; break; }
+            else if ((w[i] & 0xffff) == 54) break;
+        if (!compute) return NULL;
+    }
+    enum { MAXT = 64 };
+    uint32_t glsl = 0, floats[MAXT], nf = 0, types[MAXT], zeros[MAXT], nt = 0, nsqrt = 0;
+    uint64_t first_fn = 0;
+    for (uint64_t i = 5; i < n && w[i] >> 16;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (i + len > n) return NULL;
+        if (op == 11 && len >= 3 && !memcmp(&w[i + 2], "GLSL.std.450", 12)) glsl = w[i + 1];
+        else if (op == 22 && nf < MAXT) floats[nf++] = w[i + 1];                       // OpTypeFloat
+        else if (op == 23 && nf < MAXT) {                                               // OpTypeVector of a float
+            for (uint32_t k = 0; k < nf; k++)
+                if (floats[k] == w[i + 2]) { floats[nf++] = w[i + 1]; break; }
+        } else if (op == 54 && !first_fn) first_fn = i;                                 // OpFunction
+        else if (op == 12 && len >= 6 && glsl && w[i + 3] == glsl && w[i + 4] == 31) {  // OpExtInst Sqrt
+            int is_float = 0, known = 0;
+            for (uint32_t k = 0; k < nf; k++) is_float |= floats[k] == w[i + 1];
+            for (uint32_t k = 0; k < nt; k++) known |= types[k] == w[i + 1];
+            if (!is_float) continue;
+            if (!known) {
+                if (nt == MAXT) return NULL;
+                types[nt++] = w[i + 1];
+            }
+            nsqrt++;
+        }
+        i += len;
+    }
+    if (!nsqrt || !first_fn) return NULL;
+    uint64_t total = n + 3ull * nt + 7ull * nsqrt;
+    uint32_t *o = malloc((size_t)total * 4);
+    if (!o) rt_fatal("vk_pipeline: out of memory");
+    uint32_t bound = w[3];
+    for (uint32_t k = 0; k < nt; k++) zeros[k] = bound++;
+    uint64_t j = 0;
+    memcpy(o, w, 5 * 4);
+    j = 5;
+    for (uint64_t i = 5; i < n && w[i] >> 16;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (i == first_fn)
+            for (uint32_t k = 0; k < nt; k++) o[j++] = (3u << 16) | 46, o[j++] = types[k], o[j++] = zeros[k];   // OpConstantNull
+        int clamp = 0;
+        uint32_t z = 0;
+        if (op == 12 && len >= 6 && w[i + 3] == glsl && w[i + 4] == 31)
+            for (uint32_t k = 0; k < nt; k++)
+                if (types[k] == w[i + 1]) clamp = 1, z = zeros[k];
+        if (clamp) {   // %t = NMax %x %zero, then the Sqrt reads %t
+            uint32_t t = bound++;
+            o[j++] = (7u << 16) | 12, o[j++] = w[i + 1], o[j++] = t, o[j++] = glsl, o[j++] = 80, o[j++] = w[i + 5], o[j++] = z;
+            memcpy(&o[j], &w[i], (size_t)len * 4);
+            o[j + 5] = t;
+            j += len;
+        } else {
+            memcpy(&o[j], &w[i], (size_t)len * 4);
+            j += len;
+        }
+        i += len;
+    }
+    o[3] = bound;
+    *out_n = j;
+    return o;
+}
+
 static const uint32_t *fs_spirv_over(const GfxShader *fs, uint64_t *words) {   // the override is kept: a few shaders
     const uint32_t *w = gfx_shader_spirv(fs, words);
     uint64_t n = 0;
@@ -1307,22 +1430,91 @@ static const uint32_t *fs_spirv_over(const GfxShader *fs, uint64_t *words) {   /
     return o ? o : w;
 }
 
-static VkShaderModule make_module_linked(const uint32_t *w, uint64_t words, int geometry_chain) {
+static uint32_t oot_gloop_layout_has(const Layout *l, uint32_t binding, uint32_t count, uint32_t *q);
+
+// LOCAL (AMD): OOT_GUARDED_LOOP: the module with its guarded helpers rewritten (spv_guarded_loop.h), when the layout
+// merged exactly the buffers the rewrite loops over; bit q of *done says that l->tbl_first[q] got its module.
+static uint32_t *oot_gloop_module(const Layout *l, const uint32_t *w, uint64_t words, uint64_t *out_n, uint32_t *done) {
+    uint64_t n = 0;
+    uint32_t b0 = 0, cnt = 0, set = ~0u, q = 0;
+    uint32_t *o = spv_gloop_rewrite(w, words, &n, &b0, &cnt, &set);
+    if (!o) return NULL;
+    if (set != 0 || !oot_gloop_layout_has(l, b0, cnt, &q)) {
+        free(o);
+        return NULL;
+    }
+    static volatile int32_t told;
+    if (__atomic_add_fetch(&told, 1, __ATOMIC_RELAXED) <= 12)
+        rt_log("vk_pipeline: OOT_GUARDED_LOOP: a stage's guarded candidates loop over an array of %u buffers at binding %u (%llu -> %llu words)",
+               cnt, b0, (unsigned long long)words, (unsigned long long)n);
+    if (done) *done |= 1u << q;
+    *out_n = n;
+    return o;
+}
+
+// l: the pipeline's layout, for OOT_GUARDED_LOOP (NULL: no rewrite).
+static _Thread_local int dump_modules_tl, dump_modules_n;   // LOCAL (AMD, debug): OOT_DUMP_MODULE_WORDS
+static VkShaderModule make_module_full(const uint32_t *w, uint64_t words, int geometry_chain, const Layout *l, uint32_t *done) {
+    uint64_t src_words = words; const uint32_t *src_w = w;   // LOCAL (AMD, debug): OOT_DUMP_CS_WORDS
     uint64_t over_n = 0;
     uint32_t *over = spv_override(w, words, &over_n);
     if (over) w = over, words = over_n;
     uint32_t *minmax = spirv_nan_minmax(w, words);
     if (minmax) w = minmax;
+    uint64_t sqrt_n = 0;
+    uint32_t *sqrtc = spirv_sqrt_clamp(w, words, &sqrt_n);   // PR #91
+    if (sqrtc) w = sqrtc, words = sqrt_n;
     uint64_t fixed_n = 0;
     uint32_t *fixed = spirv_is_mesh(w, words) ? NULL : geometry_chain ? spirv_fixup_linked(w, words, &fixed_n, 1) : spirv_fixup(w, words, &fixed_n);
     if (fixed) w = fixed, words = fixed_n;
+    uint64_t wg_n = 0;   // LOCAL (AMD): mesh/task Workgroup initializers (translator patch 0042) dropped
+    uint32_t *wgfree = oot_mesh_drop_wg_init(w, words, &wg_n);
+    if (wgfree) w = wgfree, words = wg_n;
+    int gl_skip = 0;   // LOCAL (AMD, debug): OOT_GLOOP_SKIP_WORDS=<n>[,<n>]: these modules keep their candidate chains
+    {
+        static long skipw[8]; static int nskipw = -1;
+        if (nskipw < 0) { nskipw = 0; const char *e = getenv("OOT_GLOOP_SKIP_WORDS"); for (char *end; e && *e && nskipw < 8; e = *end ? end + 1 : end) skipw[nskipw++] = strtol(e, &end, 10); }
+        for (int i = 0; i < nskipw; i++) if (skipw[i] == (long)src_words) gl_skip = 1;
+        if (gl_skip) rt_log("vk_pipeline: guarded loop skipped for a %llu-word module (OOT_GLOOP_SKIP_WORDS)", (unsigned long long)src_words);
+    }
+    gl_force_table_only = gl_table_only_listed(src_words);   // LOCAL (AMD, debug): OOT_GLOOP_TABLE_ONLY
+    gl_force_no_pages = gl_no_pages_listed(src_words);   // LOCAL (AMD, debug): OOT_GLOOP_NOPAGES
+    gl_force_nostore = gl_nostore_listed(src_words);   // LOCAL (AMD): OOT_GLOOP_PAGES_NOSTORE
+    uint32_t *gloop = l && l->ntbl && !gl_skip ? oot_gloop_module(l, w, words, &words, done) : NULL;   // LOCAL (AMD): OOT_GUARDED_LOOP
+    gl_force_table_only = 0;
+    gl_force_no_pages = 0;
+    gl_force_nostore = 0;
+    if (gloop) w = gloop;
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
     VkShaderModule m = VK_NULL_HANDLE;
+    {   // LOCAL (AMD, debug): OOT_DUMP_CS_WORDS=<n>: the module before and after every rewrite when its source had n words
+        static long dump_words = -2;
+        if (dump_words == -2) { const char *e = getenv("OOT_DUMP_CS_WORDS"); dump_words = e ? atol(e) : -1; }
+        if (dump_words > 0 && (long)src_words == dump_words) {   // the compute module, before and after the rewrites
+            FILE *f0 = fopen("module-cs-pre.spv", "wb");
+            if (f0) fwrite(src_w, 4, (size_t)src_words, f0), fclose(f0);
+            FILE *f1 = fopen("module-cs-final.spv", "wb");
+            if (f1) fwrite(ci.pCode, 1, ci.codeSize, f1), fclose(f1), rt_log("vk_pipeline: dumped module-cs-pre/final.spv (%llu -> %llu words)", (unsigned long long)src_words, (unsigned long long)(ci.codeSize / 4));
+        }
+        if (dump_modules_tl) {
+            char path[128];
+            snprintf(path, sizeof path, "module-final-%llu-%d.spv", (unsigned long long)(ci.codeSize / 4), dump_modules_n++);
+            FILE *f = fopen(path, "wb");
+            if (f) fwrite(ci.pCode, 1, ci.codeSize, f), fclose(f), rt_log("vk_pipeline: dumped %s (%llu words)", path, (unsigned long long)(ci.codeSize / 4));
+        }
+    }
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);
+    free(gloop);
+    free(wgfree);
     free(fixed);
+    free(sqrtc);
     free(minmax);
     free(over);
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
+}
+
+static VkShaderModule make_module_linked(const uint32_t *w, uint64_t words, int geometry_chain) {
+    return make_module_full(w, words, geometry_chain, NULL, NULL);
 }
 
 static VkShaderModule make_module(const uint32_t *w, uint64_t words) {
@@ -1752,7 +1944,90 @@ typedef struct {
     uint32_t n;
     VkDescriptorSetLayoutBinding b[MAX_BINDINGS];
     VkPipeBinding pb[MAX_BINDINGS];
+    uint8_t tbl[MAX_BINDINGS];          // LOCAL (AMD): OOT_GUARDED_LOOP: element + 1 of a merged array, 0 not one
 } Bindings;
+
+// ---- LOCAL (AMD): OOT_GUARDED_LOOP, guarded storage candidates as a loop (spv_guarded_loop.h has the why and how)
+// add_stage marks the storage buffers of a shader's guarded candidates the rewrite loops over; layout_get gives them one
+// binding (oot_gloop_vk_bindings) and the replay's entries their element (VkPipeBinding.elem, the template's
+// dstArrayElement), so the same descriptors land in the same buffers; the module is created from the rewritten SPIR-V
+// (make_module_full), and a pipeline whose layout and modules disagree is not built. Not with independent layouts
+// (graphics pipeline libraries), whose libraries make their own modules. OOT_GUARDED_LOOP=1 on, 0 off; default on on
+// AMD GPUs: AMD's compiler (LLPC, drivers 24.7.1 and 26.10.1) inlines every helper call and never finishes those
+// pipelines, or builds them so large that the scene runs at a few frames a second.
+static int oot_gloop_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("OOT_GUARDED_LOOP");
+        int on = e && *e ? *e != '0' : vk_caps.amd;
+        rt_log("vk_pipeline: guarded storage candidates %s (OOT_GUARDED_LOOP%s)",
+               on ? "loop over one storage buffer array" : "as the translator emits them",
+               e && *e ? "" : on ? ", default on AMD" : ", default off");
+        v = on;
+    }
+    return v;
+}
+
+static void oot_gloop_mark(Bindings *B, uint32_t n0, const GfxShader *s, uint32_t off, int stage) {
+    if (!oot_gloop_on() || (P.indep && stage != GFX_STAGE_CS)) return;
+    uint64_t words = 0, on = 0;
+    const uint32_t *w = gfx_shader_spirv(s, &words);
+    uint32_t b0 = 0, cnt = 0, set = ~0u, found = 0;
+    gl_force_table_only = gl_table_only_listed(words);   // LOCAL (AMD, debug): OOT_GLOOP_TABLE_ONLY, the same decision as the module
+    gl_force_no_pages = gl_no_pages_listed(words);
+    gl_force_nostore = gl_nostore_listed(words);
+    uint32_t *o = w ? spv_gloop_rewrite(w, words, &on, &b0, &cnt, &set) : NULL;
+    gl_force_table_only = 0;
+    gl_force_no_pages = 0;
+    gl_force_nostore = 0;
+    if (!o) return;
+    free(o);
+    if (set != 0 || !b0 || !cnt || cnt > 255) return;
+    for (uint32_t i = n0; i < B->n; i++) {
+        uint32_t b = B->b[i].binding;
+        if (b < b0 + off || b >= b0 + off + cnt) continue;
+        if (B->b[i].descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || B->b[i].descriptorCount != 1) return;
+        found++;
+    }
+    if (found != cnt) {   // the reflection lists other buffers there: leave the shader as it is
+        LOG_ONCE("vk_pipeline: OOT_GUARDED_LOOP: a shader's reflection does not list its candidates' buffers; not rewritten");
+        return;
+    }
+    for (uint32_t i = n0; i < B->n; i++) {
+        uint32_t b = B->b[i].binding;
+        if (b >= b0 + off && b < b0 + off + cnt) B->tbl[i] = (uint8_t)(b - b0 - off + 1);
+    }
+}
+
+// The replay's entries of merged arrays: binding of the array, their element. After the sort.
+static void oot_gloop_elems(Bindings *B) {
+    for (uint32_t i = 0; i < B->n; i++)
+        if (B->tbl[i]) B->pb[i].elem = (uint16_t)(B->tbl[i] - 1), B->pb[i].binding = (uint16_t)(B->b[i].binding - (B->tbl[i] - 1u));
+}
+
+// The layout's bindings as Vulkan gets them: each array's elements (consecutive bindings, sorted) as one binding.
+static uint32_t oot_gloop_vk_bindings(const Layout *l, VkDescriptorSetLayoutBinding *out) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < l->n; i++) {
+        if (l->tbl[i] > 1 && n) out[n - 1].descriptorCount += l->b[i].descriptorCount;
+        else out[n++] = l->b[i];
+    }
+    return n;
+}
+
+// The array at binding holds exactly count buffers: its index among the layout's arrays in *q.
+static uint32_t oot_gloop_layout_has(const Layout *l, uint32_t binding, uint32_t count, uint32_t *q) {
+    for (uint32_t i = 0; i < l->ntbl; i++)
+        if (l->tbl_first[i] == binding) {
+            uint32_t k0 = 0, len = 0;
+            while (k0 < l->n && !(l->tbl[k0] == 1 && l->b[k0].binding == binding)) k0++;
+            while (k0 + len < l->n && l->tbl[k0 + len] == len + 1) len++;
+            if (len != count) return 0;
+            *q = i;
+            return 1;
+        }
+    return 0;
+}
 
 static VkDescriptorType descriptor_type(int kind, const GfxShaderRes *r) {
     int buffer = (r->type & 0xff) == 2;
@@ -1773,6 +2048,42 @@ static int spirv_is_mesh(const uint32_t *w, uint64_t n) {
     for (uint64_t i = 5; i < n && w[i] >> 16; i += w[i] >> 16)
         if ((w[i] & 0xffff) == 15) return i + 1 < n && w[i + 1] == 5365;
     return 0;
+}
+
+// LOCAL (AMD): translator patch 0042 (v0.3.3) gives Workgroup variables an OpConstantNull initializer (local memory
+// reads as zero on the Switch). AMD's compiler (LLPC, Adrenalin 26.10.1) rejects it in a mesh or task stage
+// (VK_ERROR_INITIALIZATION_FAILED outside the game for mesh 535134dde83aef18, u32[965] in Workgroup); in the game that
+// build never returned and the boot prewarm, or the Kokiri load, froze. Those modules lose the Workgroup initializers on
+// AMD, as before 0.3.3 (the pipeline then builds in 0.08 s). OOT_MESH_WG_INIT=1 keeps them. NULL: nothing to drop.
+static uint32_t *oot_mesh_drop_wg_init(const uint32_t *w, uint64_t n, uint64_t *out_n) {
+    static int keep = -1;
+    if (keep < 0) { const char *e = getenv("OOT_MESH_WG_INIT"); keep = e && *e ? *e != '0' : !vk_caps.amd; }
+    if (keep || n < 5) return NULL;
+    int mesh = 0, found = 0;
+    for (uint64_t i = 5; i < n && w[i] >> 16; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == 15 && i + 1 < n && (w[i + 1] == 5365 || w[i + 1] == 5364)) mesh = 1;   // MeshEXT, TaskEXT
+        if (op == 59 && len == 5 && i + 3 < n && w[i + 3] == 4) found++;   // OpVariable ... Workgroup <initializer>
+    }
+    if (!mesh || !found) return NULL;
+    uint32_t *o = malloc((size_t)n * 4);
+    if (!o) return NULL;
+    memcpy(o, w, 20);
+    uint64_t k = 5;
+    for (uint64_t i = 5; i < n && w[i] >> 16; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (i + len > n) { free(o); return NULL; }
+        if (op == 59 && len == 5 && w[i + 3] == 4) {
+            o[k++] = 4u << 16 | 59;
+            o[k++] = w[i + 1], o[k++] = w[i + 2], o[k++] = w[i + 3];
+            continue;
+        }
+        memcpy(o + k, w + i, (size_t)len * 4);
+        k += len;
+    }
+    LOG_ONCE("vk_pipeline: mesh and task modules lose their Workgroup initializers on AMD (OOT_MESH_WG_INIT=1 keeps them)");
+    *out_n = k;
+    return o;
 }
 
 static VkShaderStageFlags stage_bit(int stage) {
@@ -1806,10 +2117,12 @@ static int add_stage(Bindings *B, const GfxShader *s, uint32_t off) {
     if (!B->n) {
         B->b[0] = (VkDescriptorSetLayoutBinding){0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL};
         B->pb[0] = (VkPipeBinding){0, (uint8_t)stage, VK_PIPE_SUPPORT, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, 0, NULL};
+        B->tbl[0] = 0;
         B->n = 1;
     }
     B->b[0].stageFlags |= bit;
     B->pb[0].stages |= bit;
+    uint32_t oot_n0 = B->n;   // LOCAL (AMD): OOT_GUARDED_LOOP marks this stage's entries below
     for (int k = 0; k < GFX_RES_KINDS; k++) {
         const GfxShaderRes *r;
         int n = gfx_shader_resources(s, k, &r);
@@ -1820,9 +2133,11 @@ static int add_stage(Bindings *B, const GfxShader *s, uint32_t off) {
             if (binding > UINT16_MAX) return 0;           // VkPipeBinding must not truncate a stage's binding
             B->b[B->n] = (VkDescriptorSetLayoutBinding){binding, t, count, bit, NULL};
             B->pb[B->n] = (VkPipeBinding){(uint16_t)binding, (uint8_t)stage, (uint8_t)k, t, (uint16_t)count, bit, &r[i]};
+            B->tbl[B->n] = 0;
             B->n++;
         }
     }
+    oot_gloop_mark(B, oot_n0, s, off, stage);
     return 1;
 }
 
@@ -1881,14 +2196,15 @@ static int layout_covers(const VkPipeState *s, const Layout *l, uint32_t fs_off,
 // layouts hold the compute stage only). VK_NULL_HANDLE when templates are off, for an empty set, for a push set
 // without vkCmdPushDescriptorSetWithTemplateKHR or when creation fails: the replay then writes the set with write
 // structs.
-static VkDescriptorUpdateTemplate make_tpl(const VkDescriptorSetLayoutBinding *b, uint32_t n, VkDescriptorSetLayout sl,
-                                           int push, VkPipelineLayout pl, uint32_t set) {
+static VkDescriptorUpdateTemplate make_tpl(const VkDescriptorSetLayoutBinding *b, const uint8_t *tbl, uint32_t n,
+                                           VkDescriptorSetLayout sl, int push, VkPipelineLayout pl, uint32_t set) {
     if (!P.tpl || !n || (push && !P.tpl_push)) return VK_NULL_HANDLE;
     VkDescriptorUpdateTemplateEntry e[MAX_BINDINGS];
     size_t off = 0;
     VkShaderStageFlags stages = 0;
     for (uint32_t i = 0; i < n; i++) {
-        e[i] = (VkDescriptorUpdateTemplateEntry){b[i].binding, 0, b[i].descriptorCount, b[i].descriptorType, off, sizeof(VkDescSlot)};
+        uint32_t el = tbl && tbl[i] ? tbl[i] - 1u : 0;   // LOCAL (AMD): OOT_GUARDED_LOOP: element el of the array at binding - el
+        e[i] = (VkDescriptorUpdateTemplateEntry){b[i].binding - el, el, b[i].descriptorCount, b[i].descriptorType, off, sizeof(VkDescSlot)};
         off += sizeof(VkDescSlot) * b[i].descriptorCount;
         stages |= b[i].stageFlags;
     }
@@ -1914,12 +2230,14 @@ static int64_t bindings_sort(Bindings *B, uint64_t *h) {
         for (uint32_t j = i; j > 0 && B->b[j - 1].binding > B->b[j].binding; j--) {
             VkDescriptorSetLayoutBinding t = B->b[j]; B->b[j] = B->b[j - 1]; B->b[j - 1] = t;
             VkPipeBinding u = B->pb[j]; B->pb[j] = B->pb[j - 1]; B->pb[j - 1] = u;
+            uint8_t g = B->tbl[j]; B->tbl[j] = B->tbl[j - 1]; B->tbl[j - 1] = g;   // LOCAL (AMD): OOT_GUARDED_LOOP
         }
     int64_t total = 0;
     for (uint32_t i = 0; i < B->n; i++) {
         if (i && B->b[i].binding == B->b[i - 1].binding) return -1;
         uint32_t k[4] = {B->b[i].binding, B->b[i].descriptorType, B->b[i].descriptorCount, B->b[i].stageFlags};
         *h = fnv(*h, k, sizeof k);
+        if (B->tbl[i]) *h = fnv(*h, &B->tbl[i], 1);   // LOCAL (AMD): a merged list is another layout
         total += B->b[i].descriptorCount;
     }
     return total;
@@ -1931,15 +2249,23 @@ static Layout *layout_get(Bindings *B) {
     if (total < 0) return NULL;
     Layout **head = &layouts[h % LAYOUT_BUCKETS];
     for (Layout *l = *head; l; l = l->next)
-        if (l->hash == h && l->n == B->n && !memcmp(l->b, B->b, B->n * sizeof *B->b)) return l;
+        if (l->hash == h && l->n == B->n && !memcmp(l->b, B->b, B->n * sizeof *B->b) && !memcmp(l->tbl, B->tbl, B->n)) {
+            oot_gloop_elems(B);
+            return l;
+        }
     Layout *l = calloc(1, sizeof *l + B->n * sizeof *B->b);
     if (!l) return NULL;
     l->hash = h, l->n = B->n;
     memcpy(l->b, B->b, B->n * sizeof *B->b);
+    memcpy(l->tbl, B->tbl, B->n);
+    for (uint32_t i = 0; i < l->n; i++)   // LOCAL (AMD): OOT_GUARDED_LOOP
+        if (l->tbl[i] == 1 && l->ntbl < 4) l->tbl_first[l->ntbl++] = l->b[i].binding;
     l->push = total <= (int64_t)P.max_push;
+    VkDescriptorSetLayoutBinding vkb[MAX_BINDINGS];   // LOCAL (AMD): OOT_GUARDED_LOOP: the arrays merged
+    uint32_t nvkb = oot_gloop_vk_bindings(l, vkb);
     VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                           .flags = l->push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
-                                          .bindingCount = l->n, .pBindings = l->b};
+                                          .bindingCount = nvkb, .pBindings = vkb};
     if (vkCreateDescriptorSetLayout(P.device, &si, NULL, &l->set) != VK_SUCCESS) {
         free(l);
         return NULL;
@@ -1952,11 +2278,12 @@ static Layout *layout_get(Bindings *B) {
         free(l);
         return NULL;
     }
-    l->tpl[0] = make_tpl(l->b, l->n, l->set, l->push, l->layout, 0);
+    l->tpl[0] = make_tpl(l->b, l->tbl, l->n, l->set, l->push, l->layout, 0);
     l->next = *head;
     *head = l;
     P.stats.layouts++;
     P.stats.push_layouts += (uint64_t)l->push;
+    oot_gloop_elems(B);
     return l;
 }
 
@@ -2010,8 +2337,8 @@ static Layout *layout_pair(Bindings *B, Bindings *F) {
         free(l);
         return NULL;
     }
-    l->tpl[0] = make_tpl(l->b, n0, l->set, l->push, l->layout, 0);
-    l->tpl[1] = make_tpl(l->b + n0, n - n0, l->set1, l->push1, l->layout, 1);
+    l->tpl[0] = make_tpl(l->b, NULL, n0, l->set, l->push, l->layout, 0);
+    l->tpl[1] = make_tpl(l->b + n0, NULL, n - n0, l->set1, l->push1, l->layout, 1);
     l->next = *head;
     *head = l;
     P.stats.layouts++;
@@ -2634,8 +2961,14 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     }
     if (s->gs && (l->set1 || !k->geometry_input || k->geometry_input > GFX_GEOMETRY_TRIANGLES_ADJACENCY)) return VK_NULL_HANDLE;
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE, gm = VK_NULL_HANDLE;
+    uint32_t gl_done = 0;   // LOCAL (AMD): OOT_GUARDED_LOOP: the merged arrays that got their rewritten module
     uint64_t vw, fw;
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
+    {   // LOCAL (AMD, debug)
+        static long want = -2;
+        if (want == -2) { const char *e = getenv("OOT_DUMP_MODULE_WORDS"); want = e ? atol(e) : -1; }
+        dump_modules_tl = want > 0 && (long)vw == want, dump_modules_n = 0;
+    }
     uint32_t *vpatched = NULL, *fpatched = NULL;
     // AMD: no outputs are added to a mesh shader. Vertex-style outputs added to a mesh module make AMD's compiler (LLPC,
     // amdvlk64.dll+0xf3c1af) crash or fail: the same module rebuilt outside the game without them builds in 45 ms
@@ -2700,19 +3033,20 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             fcode = fpatched = r;
         }
         // A bound colour target outside the shader's output map gets write mask 0 (target_wmask)
-        if (fcode) fm = make_module(fcode, fw);
+        if (fcode) fm = make_module_full(fcode, fw, 0, l, &gl_done);
     }
     if (s->gs) {
         uint64_t gw = 0;
         const uint32_t *gcode = gfx_shader_spirv(s->gs, &gw);
         uint32_t off = binding_span(s->vs) - 1;
         uint32_t *patched = off && gcode ? spirv_rebind(gcode, gw, off) : NULL;
-        if (gcode && (!off || patched)) gm = make_module(patched ? patched : gcode, gw);
+        if (gcode && (!off || patched)) gm = make_module_full(patched ? patched : gcode, gw, 0, l, &gl_done);
         free(patched);
     }
     // Only a VS linked to GS uses the GS-chain dead-distance declaration policy.
     // Plain VS/FS modules retain their original fixup path and uploaded bytes.
-    vm = make_module_linked(vcode, vw, s->gs != NULL);
+    vm = make_module_full(vcode, vw, s->gs != NULL, l, &gl_done);
+    dump_modules_tl = 0;   // LOCAL (AMD, debug)
     free(vpatched), free(fpatched);
     VkShaderModule tm = VK_NULL_HANDLE;   // LOCAL TEST (Ocarina): the task stage, bindings after the mesh stage's
     if (s->ts) {
@@ -2720,11 +3054,15 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         const uint32_t *tcode = gfx_shader_spirv(s->ts, &tw);
         uint32_t off = binding_span(s->vs) - 1;
         uint32_t *patched = off && tcode ? spirv_rebind(tcode, tw, off) : NULL;
-        if (tcode && (!off || patched)) tm = make_module(patched ? patched : tcode, tw);
+        if (tcode && (!off || patched)) tm = make_module_full(patched ? patched : tcode, tw, 0, l, &gl_done);
         free(patched);
     }
     VkPipeline pipe = VK_NULL_HANDLE;
     if (!vm || (s->fs && !fm) || (s->gs && !gm) || (s->ts && !tm)) goto out;
+    if (l->ntbl && gl_done != (1u << l->ntbl) - 1) {   // LOCAL (AMD): a merged array without its rewritten module
+        LOG_ONCE("vk_pipeline: OOT_GUARDED_LOOP: a stage's SPIR-V did not take the rewrite its layout expects; pipeline not built");
+        goto out;
+    }
 
     VkPipelineShaderStageCreateInfo stages[4];
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rq[4];
@@ -2883,9 +3221,93 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         if (min_b < 0) { const char *e = getenv("OOT_BIG_GFX_BINDINGS"); min_b = e ? atoi(e) : 48; }
         if (!opt && gwords >= (uint64_t)big_cs_words() && l->n >= (uint32_t)min_b) pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     }
+    {   // LOCAL (AMD, debug): OOT_PIPE_DUMP=<hex in the note>: this pipeline's state and SPIR-V for tools/amd/pipe_replay
+        static const char *want = (const char *)1;
+        static int dumped;
+        if (want == (const char *)1) want = getenv("OOT_PIPE_DUMP");
+        int hex_only = want && *want && strspn(want, "0123456789abcdefABCDEF") == strlen(want) && strlen(want) <= 16;
+        if (hex_only && !dumped && strstr(note, want)) {   // a hex hash only: it names the folder
+            dumped = 1;
+            char dir[512], path[640];
+            snprintf(dir, sizeof dir, "pipe-dump-%s", want);
+            plat_file_mkdir_p(dir);
+            snprintf(path, sizeof path, "%s/pipeline.txt", dir);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fprintf(f, "flags %x\n", (unsigned)(pi.flags & ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT));
+                for (uint32_t i = 0; i < stage_count; i++) {
+                    const GfxShader *st4[4] = {s->ts, s->vs, s->gs, s->fs};
+                    const GfxShader *sh = NULL;
+                    for (int k = 0; k < 4 && !sh; k++) {
+                        if (!st4[k]) continue;
+                        VkShaderStageFlags bit = gfx_shader_is_task(st4[k]) ? VK_SHADER_STAGE_TASK_BIT_EXT : gfx_shader_is_mesh(st4[k]) ? VK_SHADER_STAGE_MESH_BIT_EXT :
+                                                 k == 1 ? VK_SHADER_STAGE_VERTEX_BIT : k == 2 ? VK_SHADER_STAGE_GEOMETRY_BIT : k == 3 ? VK_SHADER_STAGE_FRAGMENT_BIT : 0;
+                        if (bit == stages[i].stage) sh = st4[k];
+                    }
+                    uint64_t w = 0;
+                    const uint32_t *c = sh ? gfx_shader_spirv(sh, &w) : NULL;
+                    char fn[64];
+                    snprintf(fn, sizeof fn, "stage%u.spv", i);
+                    snprintf(path, sizeof path, "%s/%s", dir, fn);
+                    FILE *g = c ? fopen(path, "wb") : NULL;
+                    if (g) fwrite(c, 4, (size_t)w, g), fclose(g);
+                    fprintf(f, "stage %x %s %u %x\n", (unsigned)stages[i].stage, fn, stages[i].pNext ? (unsigned)vk_caps.sg_size : 0u, (unsigned)stages[i].flags);
+                }
+                if (pi.pVertexInputState) {
+                    fprintf(f, "vertex_input\n");
+                    for (uint32_t i = 0; i < vi.vertexBindingDescriptionCount; i++)
+                        fprintf(f, "vi_binding %u %u %u\n", vi.pVertexBindingDescriptions[i].binding, vi.pVertexBindingDescriptions[i].stride, (unsigned)vi.pVertexBindingDescriptions[i].inputRate);
+                    for (uint32_t i = 0; i < vi.vertexAttributeDescriptionCount; i++)
+                        fprintf(f, "vi_attr %u %u %u %u\n", vi.pVertexAttributeDescriptions[i].location, vi.pVertexAttributeDescriptions[i].binding, (unsigned)vi.pVertexAttributeDescriptions[i].format, vi.pVertexAttributeDescriptions[i].offset);
+                }
+                if (pi.pInputAssemblyState) fprintf(f, "input_assembly %u %u\n", (unsigned)ia.topology, (unsigned)ia.primitiveRestartEnable);
+                fprintf(f, "viewport %u %u %d\n", vp.viewportCount, vp.scissorCount, 0);
+                fprintf(f, "raster %u %u %u %u %u %u %f %d\n", (unsigned)rs.depthClampEnable, (unsigned)rs.rasterizerDiscardEnable, (unsigned)rs.polygonMode,
+                        (unsigned)rs.cullMode, (unsigned)rs.frontFace, (unsigned)rs.depthBiasEnable, rs.lineWidth, 0);
+                fprintf(f, "multisample %u %u %f %u %u\n", (unsigned)ms.rasterizationSamples, (unsigned)ms.sampleShadingEnable, ms.minSampleShading,
+                        (unsigned)ms.alphaToCoverageEnable, (unsigned)ms.alphaToOneEnable);
+                fprintf(f, "depth_stencil %u %u %u %u %u %f %f\n", (unsigned)ds.depthTestEnable, (unsigned)ds.depthWriteEnable, (unsigned)ds.depthCompareOp,
+                        (unsigned)ds.depthBoundsTestEnable, (unsigned)ds.stencilTestEnable, ds.minDepthBounds, ds.maxDepthBounds);
+                fprintf(f, "blend %u %u %u\n", (unsigned)cb.logicOpEnable, (unsigned)cb.logicOp, cb.attachmentCount);
+                for (uint32_t i = 0; i < cb.attachmentCount && i < 8; i++) {
+                    const VkPipelineColorBlendAttachmentState *a = &cb.pAttachments[i];
+                    fprintf(f, "blend_att %u %u %u %u %u %u %u %x\n", (unsigned)a->blendEnable, (unsigned)a->srcColorBlendFactor, (unsigned)a->dstColorBlendFactor,
+                            (unsigned)a->colorBlendOp, (unsigned)a->srcAlphaBlendFactor, (unsigned)a->dstAlphaBlendFactor, (unsigned)a->alphaBlendOp, (unsigned)a->colorWriteMask);
+                }
+                fprintf(f, "dynamic %u", dy.dynamicStateCount);
+                for (uint32_t i = 0; i < dy.dynamicStateCount; i++) fprintf(f, " %u", (unsigned)dy.pDynamicStates[i]);
+                fprintf(f, "\n");
+                fprintf(f, "rendering %u %u %u %u", ri.viewMask, (unsigned)ri.depthAttachmentFormat, (unsigned)ri.stencilAttachmentFormat, ri.colorAttachmentCount);
+                for (uint32_t i = 0; i < ri.colorAttachmentCount; i++) fprintf(f, " %u", (unsigned)ri.pColorAttachmentFormats[i]);
+                fprintf(f, "\n");
+                if (l->set1) {   // independent sets: set 0 = b[0..n0), set 1 = the rest, set 2 bindless
+                    fprintf(f, "layout %x 3\n", (unsigned)VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT);
+                    fprintf(f, "set 0 %x %u\n", l->push ? 1u : 0u, l->n0);
+                    for (uint32_t i = 0; i < l->n0; i++) fprintf(f, "binding %u %u %u %x\n", l->b[i].binding, (unsigned)l->b[i].descriptorType, l->b[i].descriptorCount, (unsigned)l->b[i].stageFlags);
+                    fprintf(f, "set 1 %x %u\n", l->push1 ? 1u : 0u, l->n - l->n0);
+                    for (uint32_t i = l->n0; i < l->n; i++) fprintf(f, "binding %u %u %u %x\n", l->b[i].binding, (unsigned)l->b[i].descriptorType, l->b[i].descriptorCount, (unsigned)l->b[i].stageFlags);
+                    fprintf(f, "set 2 bindless\n");
+                } else {   // merged set 0 (OOT_GUARDED_LOOP arrays), an empty set 1, the bindless set 2
+                    VkDescriptorSetLayoutBinding vkb2[MAX_BINDINGS];
+                    uint32_t nv = oot_gloop_vk_bindings(l, vkb2);
+                    fprintf(f, "layout 0 3\n");
+                    fprintf(f, "set 0 %x %u\n", l->push ? 1u : 0u, nv);
+                    for (uint32_t i = 0; i < nv; i++) fprintf(f, "binding %u %u %u %x\n", vkb2[i].binding, (unsigned)vkb2[i].descriptorType, vkb2[i].descriptorCount, (unsigned)vkb2[i].stageFlags);
+                    fprintf(f, "set 1 0 0\n");
+                    fprintf(f, "set 2 bindless\n");
+                }
+                fclose(f);
+                rt_log("vk_pipeline: dumped %s for pipe_replay (%s)", dir, note);
+            }
+        }
+    }
     if (gfx_probe) pi.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
     uint64_t g0 = plat_now_ns(), c0 = g0;
     plat_crash_note(note);
+    static int log_builds = -1;   // LOCAL (AMD, debug): OOT_LOG_GFX_BUILDS=1: each build's start and end
+    if (log_builds < 0) log_builds = getenv("OOT_LOG_GFX_BUILDS") != NULL;
+    if (log_builds) rt_log("gfx build start: %s%s, %llu words, cache %s", note, gfx_probe ? " (probe)" : "",
+                           (unsigned long long)total_words, cache == P.cache ? "shared" : cache ? "own" : "none");
     // Pipeline binaries (above): a kept one is created without compiling; otherwise the compile captures its data so a
     // slow one can be kept. A probe of the cache does neither.
     char pbp[PLAT_PATH_MAX * 2 + 160];
@@ -2935,6 +3357,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         if (pbk) pi.pNext = f2.pNext;
     }
     plat_crash_note(NULL);
+    if (log_builds) rt_log("gfx build end: %s: %d after %.1f s", note, (int)r, (double)(plat_now_ns() - g0) / 1e9);
     double c_s = (double)(plat_now_ns() - c0) / 1e9;
     if (pbk && !from_bin && r == VK_SUCCESS && pipe) {
         // pbp is the optimized build's name, and the slower fallback must not load from it on every later start.
@@ -3353,7 +3776,7 @@ typedef struct Job {
     GKey k;
 } Job;
 
-#define MAX_WORKERS 8
+#define MAX_WORKERS 16   // LOCAL (AMD): room for OOT_PIPE_WORKERS (the default count is unchanged, below)
 
 static struct {
     int on;                            // set once by vk_pipeline_async_enable, before the replay runs
@@ -3494,13 +3917,14 @@ static void keys_flush(void) {
 static void crashed_open(const char *keys_path);
 // Reads the key file into K.file and its record hashes into the set. Caller holds P.lock (ensure_init).
 static void keys_open(void) {
-    if (!A.on || !P.cache_path[0]) return;
+    if (!P.cache_path[0]) return;   // LOCAL (AMD): the crash quarantine also without the async mode (--shot), below
     snprintf(K.path, sizeof K.path, "%s", P.cache_path);
     char *slash = strrchr(K.path, '\\'), *fslash = strrchr(K.path, '/');
     if (fslash > slash) slash = fslash;
     snprintf(slash ? slash + 1 : K.path, sizeof K.path - (size_t)(slash ? slash + 1 - K.path : 0), "pipeline-keys.bin");
     gfx_shader_record_at(K.path);   // shader-answers.bin next to it (gfx_shader.c)
     crashed_open(K.path);
+    if (!A.on) return;
     FILE *f = fopen(K.path, "rb");
     if (!f) return;
     KeysHeader h;
@@ -3674,7 +4098,12 @@ static void pipe_worker(void *arg) {
         if (!pipe) {
             // As with the big compute worker, do not hold the shared driver
             // cache during a large compilation.
-            VkPipelineCache own = j->large ? cache_private() : VK_NULL_HANDLE;
+            // LOCAL (AMD): OOT_PIPE_OWN_CACHE: a large job too builds in an empty cache of its own, not in a private copy seeded
+            // from the shared cache (cache_private merges the whole 350 MiB cache in, then back out: with 1663 large jobs
+            // on 6 workers that merging kept the CPU busy for minutes, replay 12 -> 17 ms). The driver's own disk cache
+            // still answers for shaders it compiled before.
+            VkPipelineCache own = oot_own_cache();
+            if (!own && j->large) own = cache_private();
             tl_deferred = 0;
             pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off, own ? own : P.cache);
             deferred = !pipe && tl_deferred;
@@ -3838,10 +4267,13 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
                    .large = large, .probed = !probe_on || (getenv("OOT_PIPE_PROBE") && !strcmp(getenv("OOT_PIPE_PROBE"), "0")),
                    .big = vk_caps.amd && words >= big_cs_words(), .worker = -1, .s = *s, .k = *k};
     } else if (!why) {
+        VkPipelineCache own = oot_own_cache();   // LOCAL (AMD): OOT_PIPE_OWN_CACHE
         tl_deferred = 0;
         tl_holds_plock = 1;
-        if (!(pipe = create_graphics(s, k, l, fs_off, P.cache)) && !tl_deferred) why = "pipeline creation failed";
+        pipe = create_graphics(s, k, l, fs_off, own ? own : P.cache);
         tl_holds_plock = 0;
+        oot_own_done(own, pipe != VK_NULL_HANDLE);
+        if (!pipe && !tl_deferred) why = "pipeline creation failed";
     }
     if (why) {
         P.stats.failures++;
@@ -4069,7 +4501,9 @@ static void warm_builder(void *arg) {
         j->low = 0;                    // not on a pool thread: promote() has nothing to raise
         plat_mutex_unlock(&P.lock);
         tl_deferred = 0;
-        VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off, P.cache);
+        VkPipelineCache own = oot_own_cache();   // LOCAL (AMD): OOT_PIPE_OWN_CACHE
+        VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off, own ? own : P.cache);
+        oot_own_done(own, pipe != VK_NULL_HANDLE);
         int deferred = !pipe && tl_deferred;   // the guest started meanwhile (TOTK_PREWARM_WAIT_MS ran out)
         plat_mutex_lock(&P.lock);
         if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
@@ -4277,8 +4711,14 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
     if (cs_code_override) code = cs_code_override, words = cs_words_override;
-    VkShaderModule m = make_module(code, words);
+    uint32_t gl_done = 0;   // LOCAL (AMD): OOT_GUARDED_LOOP
+    VkShaderModule m = make_module_full(code, words, 0, l, &gl_done);
     if (!m) return VK_NULL_HANDLE;
+    if (l->ntbl && gl_done != (1u << l->ntbl) - 1) {
+        LOG_ONCE("vk_pipeline: OOT_GUARDED_LOOP: a compute shader did not take the rewrite its layout expects; pipeline not built");
+        vkDestroyShaderModule(P.device, m, NULL);
+        return VK_NULL_HANDLE;
+    }
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqc;
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -4352,10 +4792,48 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
         uint64_t c0 = plat_now_ns();
         if (big) rt_log("vk_pipeline: compiling a big compute shader: %llu words", (unsigned long long)words);
         // A capturing compile takes no pipeline cache (Vulkan requires VK_NULL_HANDLE with the capture flag).
-        VkPipelineCache build_cache = pbk ? VK_NULL_HANDLE : cs_build_cache ? cs_build_cache : P.cache;
+        VkPipelineCache own = pbk || cs_build_cache ? VK_NULL_HANDLE : oot_own_cache();   // LOCAL (AMD): OOT_PIPE_OWN_CACHE
+        VkPipelineCache build_cache = pbk ? VK_NULL_HANDLE : cs_build_cache ? cs_build_cache : own ? own : P.cache;
         int shared = build_cache && build_cache == P.cache;
         if (shared) plat_mutex_lock_shared(&cache_access);
+        static long cs_stats[8]; static int ncs_stats = -1;   // LOCAL (AMD, debug): OOT_CS_STATS=<words>,...: driver statistics
+        if (ncs_stats < 0) { ncs_stats = 0; const char *e_ = getenv("OOT_CS_STATS"); for (char *end; e_ && *e_ && ncs_stats < 8; e_ = *end ? end + 1 : end) cs_stats[ncs_stats++] = strtol(e_, &end, 10); }
+        int want_stats = 0;
+        for (int q = 0; q < ncs_stats; q++) if (cs_stats[q] == (long)words) want_stats = 1;
+        if (want_stats) ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR, build_cache = VK_NULL_HANDLE;
         if (vkCreateComputePipelines(P.device, build_cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+        if (want_stats && pipe) {
+            PFN_vkGetPipelineExecutablePropertiesKHR gp = (PFN_vkGetPipelineExecutablePropertiesKHR)vkGetDeviceProcAddr(P.device, "vkGetPipelineExecutablePropertiesKHR");
+            PFN_vkGetPipelineExecutableStatisticsKHR gs = (PFN_vkGetPipelineExecutableStatisticsKHR)vkGetDeviceProcAddr(P.device, "vkGetPipelineExecutableStatisticsKHR");
+            VkPipelineInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, .pipeline = pipe};
+            uint32_t ne = 0;
+            if (gp && gs && gp(P.device, &pi, &ne, NULL) == VK_SUCCESS && ne) {
+                VkPipelineExecutablePropertiesKHR props[4];
+                if (ne > 4) ne = 4;
+                for (uint32_t q = 0; q < ne; q++) props[q] = (VkPipelineExecutablePropertiesKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR};
+                gp(P.device, &pi, &ne, props);
+                for (uint32_t q = 0; q < ne; q++) {
+                    VkPipelineExecutableInfoKHR ei = {.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, .pipeline = pipe, .executableIndex = q};
+                    uint32_t ns = 0;
+                    gs(P.device, &ei, &ns, NULL);
+                    VkPipelineExecutableStatisticKHR st[48];
+                    if (ns > 48) ns = 48;
+                    for (uint32_t k = 0; k < ns; k++) st[k] = (VkPipelineExecutableStatisticKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR};
+                    gs(P.device, &ei, &ns, st);
+                    rt_log("cs stats: %llu words, executable %u \"%s\" subgroup %u: %u statistics", (unsigned long long)words, q, props[q].name, props[q].subgroupSize, ns);
+                    for (uint32_t k = 0; k < ns; k++) {
+                        char v[64];
+                        switch (st[k].format) {
+                        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: snprintf(v, sizeof v, "%u", st[k].value.b32); break;
+                        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: snprintf(v, sizeof v, "%lld", (long long)st[k].value.i64); break;
+                        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: snprintf(v, sizeof v, "%llu", (unsigned long long)st[k].value.u64); break;
+                        default: snprintf(v, sizeof v, "%g", st[k].value.f64); break;
+                        }
+                        rt_log("cs stats:   %s = %s (%s)", st[k].name, v, st[k].description);
+                    }
+                }
+            } else rt_log("cs stats: no executable properties for a %llu-word compute pipeline", (unsigned long long)words);
+        }
         int fallback = 0;   // built without optimization after the optimized build failed: never kept (below)
         if (!pipe && vk_caps.amd && !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {   // as for graphics, above
             ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
@@ -4365,6 +4843,7 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
             rt_log("vk_pipeline: compute pipeline built again without optimization: %s", pipe ? "ok" : "failed too");
         }
         if (shared) plat_mutex_unlock_shared(&cache_access);
+        oot_own_done(own, pipe != VK_NULL_HANDLE);   // LOCAL (AMD)
         mg_leave(big);
         if (pbk) ci.pNext = f2.pNext;
         double c_s = (double)(plat_now_ns() - c0) / 1e9;

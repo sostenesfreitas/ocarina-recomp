@@ -63,6 +63,7 @@ static volatile uint8_t ts_busy[TS_PAIRS]; // written until the completion threa
 static int ts_cur = -1;                    // the pair of the part being recorded, -1 untimed
 static uint64_t ts_last_end;               // completion thread: end of the latest part read (ticks)
 static volatile int64_t ts_busy_ns, ts_parts, ts_missed;
+static volatile int64_t ts_copy_ns;   // LOCAL (AMD): of ts_busy_ns, the prologues (mirror copies into VRAM)
 
 // On the first submission that wants timing (perf_gpu_timing: TOTK_TRACE=perf or the full performance overlay).
 static void ts_setup(VkCtx *c) {
@@ -205,6 +206,7 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
             if (e > from) {
                 int64_t ns = (int64_t)((double)(e - from) * ts_period);
                 plat_add64(&ts_busy_ns, ns);
+                if (!t->noted) plat_add64(&ts_copy_ns, ns);   // LOCAL (AMD): a prologue (mirror copies), no draws
                 perf_gpu_busy((uint64_t)ns);
             }
             if (e > ts_last_end) ts_last_end = e;
@@ -269,6 +271,7 @@ static void ts_drop(void) {
 static void gpu_stats(PerfGpu *g) {
     g->have_gpu = ts_state == 1;
     g->gpu_ns = (uint64_t)plat_xchg64(&ts_busy_ns, 0);
+    g->gpu_copy_ns = (uint64_t)plat_xchg64(&ts_copy_ns, 0);   // LOCAL (AMD)
     g->gpu_parts = (uint64_t)plat_xchg64(&ts_parts, 0);
     g->gpu_missed = (uint64_t)plat_xchg64(&ts_missed, 0);
     g->have_vram = vk_mem_vram(&g->vram_used, &g->vram_budget, &g->vram_exact);

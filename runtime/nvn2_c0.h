@@ -7,7 +7,8 @@
 #include "nvn_obj.h"
 
 #define NVN2_C0_LIST 0x900u    // a layout ends here: the reachable-buffer list follows
-#define NVN2_C0_BYTES 0xb00u   // 0x900..0xaff holds the reachable-buffer list (vk_exec_draw.c dyn_collect)
+#define NVN2_C0_PAGES 0xb00u   // LOCAL (AMD): OOT_GLOOP_PAGES: {table address lo, hi, page shift, entries} (vk_memory.c)
+#define NVN2_C0_BYTES 0xb10u   // 0x900..0xaff holds the reachable-buffer list (vk_exec_draw.c dyn_collect)
 #define NVN2_ROOT_TABLES 8
 #define NVN2_ROOT_WORDS 64
 
